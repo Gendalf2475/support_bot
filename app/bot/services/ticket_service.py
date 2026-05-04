@@ -326,12 +326,14 @@ class TicketService:
                     caption=first_media.get("caption") if first_media else answer.get("caption"),
                     skipped=bool(answer.get("skipped", False)),
                 )
-                for media in media_files:
+                for media_index, media in enumerate(media_files):
                     ticket_answer.media_files.append(
                         TicketAnswerMedia(
                             file_id=str(media.get("file_id") or ""),
                             media_type=str(media.get("media_type") or "media"),
                             caption=media.get("caption"),
+                            media_group_id=media.get("media_group_id"),
+                            sort_order=TicketService._media_sort_order(media, media_index),
                         )
                     )
                 self.session.add(ticket_answer)
@@ -440,10 +442,17 @@ class TicketService:
     def extract_media_files(answer: dict[str, Any]) -> list[dict[str, Any]]:
         raw_media_files = answer.get("media_files")
         if isinstance(raw_media_files, list):
-            return [
+            media_files = [
                 media
                 for media in raw_media_files
                 if isinstance(media, dict) and media.get("file_id")
+            ]
+            return [
+                media
+                for _, media in sorted(
+                    enumerate(media_files),
+                    key=lambda item: (TicketService._media_sort_order(item[1], item[0]), item[0]),
+                )
             ]
         if answer.get("file_id"):
             return [
@@ -452,9 +461,22 @@ class TicketService:
                     "media_type": answer.get("media_type"),
                     "caption": answer.get("caption"),
                     "source_message_id": answer.get("source_message_id"),
+                    "media_group_id": answer.get("media_group_id"),
+                    "sort_order": answer.get("sort_order", answer.get("source_message_id", 0)),
                 }
             ]
         return []
+
+    @staticmethod
+    def _media_sort_order(media: dict[str, Any], default: int) -> int:
+        for key in ("sort_order", "source_message_id"):
+            try:
+                value = media.get(key)
+                if value is not None:
+                    return int(value)
+            except (TypeError, ValueError):
+                continue
+        return default
 
     @staticmethod
     def get_close_reason_label(reason: str) -> str:

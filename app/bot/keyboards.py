@@ -51,10 +51,13 @@ def question_keyboard(required: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def multiple_media_keyboard() -> InlineKeyboardMarkup:
+def multiple_media_keyboard(question_index: int | None = None) -> InlineKeyboardMarkup:
+    continue_callback = CALLBACK_CONTINUE_MEDIA
+    if question_index is not None:
+        continue_callback = f"{CALLBACK_CONTINUE_MEDIA}:{question_index}"
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Продолжить", callback_data=CALLBACK_CONTINUE_MEDIA)],
+            [InlineKeyboardButton(text="Продолжить", callback_data=continue_callback)],
             [InlineKeyboardButton(text="Отмена", callback_data=CALLBACK_CANCEL_TICKET)],
         ]
     )

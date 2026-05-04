@@ -132,6 +132,8 @@ class TicketAnswerMedia(Base):
     file_id: Mapped[str] = mapped_column(String(512), nullable=False)
     media_type: Mapped[str] = mapped_column(String(32), nullable=False)
     caption: Mapped[str | None] = mapped_column(Text, nullable=True)
+    media_group_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
     answer: Mapped[TicketAnswer] = relationship(back_populates="media_files")

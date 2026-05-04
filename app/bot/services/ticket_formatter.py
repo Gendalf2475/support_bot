@@ -92,6 +92,46 @@ class TicketFormatter:
         return cls._limit_caption(caption)
 
     @classmethod
+    def build_media_group_caption(
+        cls,
+        question_number: int,
+        question_text: str,
+        media_total: int,
+        user_caption: str | None,
+    ) -> str:
+        title = (
+            f"📎 Вопрос {question_number}: {cls._clean_label(question_text)}\n"
+            f"Файлов: {media_total}"
+        )
+        caption = (user_caption or "").strip()
+        if not caption:
+            return cls._limit_caption(title)
+
+        combined = f"{title}\n\nПодпись пользователя:\n{caption}"
+        if len(combined) <= 1024:
+            return combined
+        return cls._limit_caption(caption)
+
+    @classmethod
+    def build_media_captions_text(cls, media_items: Sequence[Mapping[str, Any]]) -> str | None:
+        captions = [
+            (index, str(media.get("caption") or "").strip())
+            for index, media in enumerate(media_items, start=1)
+            if str(media.get("caption") or "").strip()
+        ]
+        if not captions:
+            return None
+        if len(captions) == 1 and captions[0][0] == 1:
+            return None
+
+        lines = ["Подписи к файлам:"]
+        lines.extend(f"{index}. {caption}" for index, caption in captions)
+        text = "\n".join(lines)
+        if len(text) <= TELEGRAM_MESSAGE_LIMIT:
+            return text
+        return text[: TELEGRAM_MESSAGE_LIMIT - 3] + "..."
+
+    @classmethod
     def iter_media_answers(
         cls,
         form: TicketForm,
@@ -105,6 +145,20 @@ class TicketFormatter:
             media_total = len(media_items)
             for media_index, media in enumerate(media_items, start=1):
                 yield question_number, question, media_index, media_total, media
+
+    @classmethod
+    def iter_question_media_groups(
+        cls,
+        form: TicketForm,
+        answers: Sequence[Mapping[str, Any]],
+    ) -> Iterable[tuple[int, TicketQuestion, list[Mapping[str, Any]]]]:
+        answers_by_question = cls._group_mapping_answers(answers)
+        for question_number, question in enumerate(form.questions, start=1):
+            media_items: list[Mapping[str, Any]] = []
+            for answer in answers_by_question.get(question.id, []):
+                media_items.extend(cls._get_media_items(answer))
+            if media_items:
+                yield question_number, question, media_items
 
     @classmethod
     def _build_card_parts(
@@ -309,10 +363,28 @@ class TicketFormatter:
     def _get_media_items(answer: Mapping[str, Any]) -> list[Mapping[str, Any]]:
         media_files = answer.get("media_files")
         if isinstance(media_files, Sequence) and not isinstance(media_files, (str, bytes)):
-            return [media for media in media_files if isinstance(media, Mapping)]
+            media_items = [media for media in media_files if isinstance(media, Mapping)]
+            return [
+                media
+                for _, media in sorted(
+                    enumerate(media_items),
+                    key=lambda item: (TicketFormatter._media_sort_order(item[1]), item[0]),
+                )
+            ]
         if answer.get("file_id"):
             return [answer]
         return []
+
+    @staticmethod
+    def _media_sort_order(media: Mapping[str, Any]) -> int:
+        for key in ("sort_order", "source_message_id"):
+            try:
+                value = media.get(key)
+                if value is not None:
+                    return int(value)
+            except (TypeError, ValueError):
+                continue
+        return 0
 
     @staticmethod
     def _get_answer_value(answer: TicketAnswer | TicketAnswerMedia | Mapping[str, Any], key: str) -> Any:

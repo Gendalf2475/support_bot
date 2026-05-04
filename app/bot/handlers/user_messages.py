@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from typing import Any
 
 from aiogram import Bot, F, Router
@@ -9,11 +11,11 @@ from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
+from aiogram.types import CallbackQuery, InputMediaPhoto, InputMediaVideo, Message, ReplyKeyboardRemove
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot.config import Settings
-from app.bot.database.models import Ticket, TicketStatus, User
+from app.bot.database.models import MessageDirection, Ticket, TicketStatus, User
 from app.bot.keyboards import (
     CALLBACK_CANCEL_TICKET,
     CALLBACK_CONTINUE_MEDIA,
@@ -65,7 +67,14 @@ DELIVERY_ERROR_TEXT = (
     "Сейчас не удалось передать обращение в поддержку. "
     "Пожалуйста, попробуйте позже или сообщите администратору группы поддержки."
 )
-MULTIPLE_MEDIA_ADDED_TEXT = "Файл добавлен.\nМожно отправить ещё файл или нажать «Продолжить»."
+MEDIA_GROUP_BUFFER_DELAY_SECONDS = 1.0
+MEDIA_GROUP_PROCESSED_TTL_SECONDS = 300.0
+MEDIA_GROUP_BUFFERS: dict[tuple[int, str], dict[str, Any]] = {}
+MEDIA_GROUP_TASKS: dict[tuple[int, str], asyncio.Task[None]] = {}
+MEDIA_GROUP_PROCESSED_AT: dict[tuple[int, str], float] = {}
+MEDIA_GROUP_LOCK = asyncio.Lock()
+MEDIA_GROUP_COMPATIBLE_TYPES = {"photo", "video"}
+CONTINUE_MEDIA_LOCKS: dict[int, asyncio.Lock] = {}
 
 
 class TicketFlow(StatesGroup):
@@ -209,36 +218,52 @@ async def handle_form_answer(
         return
     question = form.questions[question_index]
     raw_answer = extract_ticket_answer(message)
+
+    if raw_answer and raw_answer.get("file_id") and message.media_group_id and not question_accepts_multiple_media(question):
+        should_process = await should_process_single_media_group_once(message)
+        if not should_process:
+            return
+
     if (
         question_accepts_multiple_media(question)
         and get_current_media_count(list(data.get("answers", [])), question) > 0
         and not (raw_answer and raw_answer.get("file_id"))
     ):
-        await message.answer(MULTIPLE_MEDIA_ADDED_TEXT, reply_markup=multiple_media_keyboard())
+        media_count = get_current_media_count(list(data.get("answers", [])), question)
+        await message.answer(
+            build_multiple_media_confirmation_text(media_count, question.max_files, media_count >= question.max_files),
+            reply_markup=multiple_media_keyboard(question_index),
+        )
         return
 
     if question_accepts_multiple_media(question) and raw_answer and raw_answer.get("file_id"):
-        answers = append_media_to_current_answer(
-            list(data.get("answers", [])),
-            question,
-            raw_answer,
-            message.message_id,
+        media_item = build_media_item(
+            raw_answer=raw_answer,
+            source_message_id=message.message_id,
+            media_group_id=message.media_group_id,
         )
-        media_count = get_current_media_count(answers, question)
-        if media_count >= question.max_files:
-            await message.answer(f"Достигнут лимит файлов: {question.max_files}.")
-            await move_to_next_question_or_summary(message, state, form, answers, question_index + 1)
+        if message.media_group_id:
+            await buffer_multiple_media_group(
+                message=message,
+                state=state,
+                ticket_form_service=ticket_form_service,
+                media_item=media_item,
+            )
             return
 
-        await state.update_data(answers=answers)
-        await message.answer(MULTIPLE_MEDIA_ADDED_TEXT, reply_markup=multiple_media_keyboard())
+        await process_multiple_media_items(
+            message=message,
+            state=state,
+            ticket_form_service=ticket_form_service,
+            media_items=[media_item],
+        )
         return
 
     answer, validation_error = validate_question_answer(question, raw_answer)
     if validation_error:
         await message.answer(
             f"{validation_error}\n\n{build_question_text(question)}",
-            reply_markup=get_question_reply_markup(question),
+            reply_markup=get_question_reply_markup(question, question_index),
         )
         return
 
@@ -288,7 +313,10 @@ async def skip_question(
     await callback.answer()
 
 
-@router.callback_query(StateFilter(TicketFlow.answering), F.data == CALLBACK_CONTINUE_MEDIA)
+@router.callback_query(
+    StateFilter(TicketFlow.answering),
+    (F.data == CALLBACK_CONTINUE_MEDIA) | F.data.startswith(f"{CALLBACK_CONTINUE_MEDIA}:"),
+)
 async def continue_multiple_media_question(
     callback: CallbackQuery,
     state: FSMContext,
@@ -297,6 +325,20 @@ async def continue_multiple_media_question(
     message = callback.message
     if not isinstance(message, Message) or message.chat.type != ChatType.PRIVATE:
         await callback.answer("Действие доступно только в личном чате с ботом.", show_alert=True)
+        return
+
+    async with get_continue_media_lock(callback.from_user.id):
+        await handle_continue_multiple_media_question(callback, state, ticket_form_service, message)
+
+
+async def handle_continue_multiple_media_question(
+    callback: CallbackQuery,
+    state: FSMContext,
+    ticket_form_service: TicketFormService,
+    message: Message,
+) -> None:
+    if await has_pending_media_group(callback.from_user.id):
+        await callback.answer("Подождите, файлы ещё добавляются.", show_alert=True)
         return
 
     data = await state.get_data()
@@ -312,6 +354,11 @@ async def continue_multiple_media_question(
         await callback.answer("Форма устарела. Откройте тикет заново.", show_alert=True)
         return
 
+    callback_question_index = parse_continue_media_question_index(callback.data)
+    if callback_question_index is not None and callback_question_index != question_index:
+        await callback.answer("Действие устарело.", show_alert=True)
+        return
+
     question = form.questions[question_index]
     if not question_accepts_multiple_media(question):
         await callback.answer("Действие устарело.", show_alert=True)
@@ -323,7 +370,7 @@ async def continue_multiple_media_question(
         if question.required:
             await message.answer(
                 f"Пожалуйста, прикрепите файл.\n\n{build_question_text(question)}",
-                reply_markup=multiple_media_keyboard(),
+                reply_markup=multiple_media_keyboard(question_index),
             )
             await callback.answer()
             return
@@ -492,7 +539,11 @@ async def submit_ticket(
     await callback.answer()
 
 
-@router.callback_query(F.data.in_({CALLBACK_RESTART_TICKET, CALLBACK_SKIP_QUESTION, CALLBACK_SUBMIT_TICKET, CALLBACK_CONTINUE_MEDIA}))
+@router.callback_query(
+    F.data.in_({CALLBACK_RESTART_TICKET, CALLBACK_SKIP_QUESTION, CALLBACK_SUBMIT_TICKET})
+    | (F.data == CALLBACK_CONTINUE_MEDIA)
+    | F.data.startswith(f"{CALLBACK_CONTINUE_MEDIA}:")
+)
 async def stale_ticket_action(callback: CallbackQuery) -> None:
     await callback.answer("Действие устарело. Откройте тикет заново.", show_alert=True)
 
@@ -613,7 +664,7 @@ async def move_to_next_question_or_summary(
 
 async def ask_current_question(message: Message, form: TicketForm, question_index: int) -> None:
     question = form.questions[question_index]
-    await message.answer(build_question_text(question), reply_markup=get_question_reply_markup(question))
+    await message.answer(build_question_text(question), reply_markup=get_question_reply_markup(question, question_index))
 
 
 async def start_form_flow(message: Message, state: FSMContext, form: TicketForm) -> None:
@@ -686,9 +737,133 @@ async def send_ticket_media_to_support(
     form: TicketForm,
     answers: list[dict[str, Any]],
 ) -> None:
-    for question_number, question, media_index, media_total, media in TicketFormatter.iter_media_answers(form, answers):
+    for question_number, question, media_items in TicketFormatter.iter_question_media_groups(form, answers):
+        if len(media_items) > 1 and media_items_can_be_sent_as_group(media_items):
+            try:
+                await send_question_media_group_to_support(
+                    bot=bot,
+                    message_service=message_service,
+                    user=user,
+                    ticket=ticket,
+                    question_number=question_number,
+                    question=question,
+                    media_items=media_items,
+                )
+                continue
+            except TelegramAPIError as error:
+                logger.error(
+                    "Failed to send ticket media group ticket_id=%s question_id=%s: %s",
+                    ticket.id,
+                    question.id,
+                    error,
+                )
+            except TopicUnavailableError as error:
+                logger.error("Failed to send ticket media group because topic is unavailable ticket_id=%s: %s", ticket.id, error)
+
+        await send_question_media_individually_to_support(
+            bot=bot,
+            message_service=message_service,
+            user=user,
+            ticket=ticket,
+            question_number=question_number,
+            question=question,
+            media_items=media_items,
+        )
+
+
+async def send_question_media_group_to_support(
+    bot: Bot,
+    message_service: MessageService,
+    user: User,
+    ticket: Ticket,
+    question_number: int,
+    question: TicketQuestion,
+    media_items: list[Any],
+) -> None:
+    if ticket.topic_id is None:
+        raise TopicUnavailableError("Ticket has no topic_id")
+
+    media_total = len(media_items)
+    first_caption = TicketFormatter.build_media_group_caption(
+        question_number=question_number,
+        question_text=question.text,
+        media_total=media_total,
+        user_caption=media_items[0].get("caption"),
+    )
+    input_media = []
+    for media_index, media in enumerate(media_items):
+        media_type = media.get("media_type")
+        media_kwargs: dict[str, Any] = {"media": str(media.get("file_id"))}
+        if media_index == 0:
+            media_kwargs["caption"] = first_caption
+        if media_type == "photo":
+            input_media.append(InputMediaPhoto(**media_kwargs))
+        elif media_type == "video":
+            input_media.append(InputMediaVideo(**media_kwargs))
+
+    if not input_media:
+        return
+
+    try:
+        sent_messages = await bot.send_media_group(
+            chat_id=message_service.support_chat_id,
+            message_thread_id=ticket.topic_id,
+            media=input_media,
+        )
+    except TelegramBadRequest as error:
+        if MessageService.is_topic_unavailable_error(error):
+            raise TopicUnavailableError(str(error)) from error
+        raise
+
+    for media, sent_message in zip(media_items, sent_messages, strict=False):
+        source_message_id = parse_optional_int(media.get("source_message_id"))
+        if source_message_id is None:
+            continue
+        await message_service.create_message_map(
+            user=user,
+            user_message_id=source_message_id,
+            support_message_id=sent_message.message_id,
+            topic_id=ticket.topic_id,
+            direction=MessageDirection.TICKET_FORM_MEDIA,
+            ticket_id=ticket.id,
+        )
+
+    captions_text = TicketFormatter.build_media_captions_text(media_items)
+    if captions_text:
+        try:
+            await bot.send_message(
+                chat_id=message_service.support_chat_id,
+                message_thread_id=ticket.topic_id,
+                text=captions_text,
+            )
+        except TelegramAPIError as error:
+            logger.error(
+                "Failed to send ticket media captions text ticket_id=%s question_id=%s: %s",
+                ticket.id,
+                question.id,
+                error,
+            )
+
+
+async def send_question_media_individually_to_support(
+    bot: Bot,
+    message_service: MessageService,
+    user: User,
+    ticket: Ticket,
+    question_number: int,
+    question: TicketQuestion,
+    media_items: list[Any],
+) -> None:
+    media_total = len(media_items)
+    for media_index, media in enumerate(media_items, start=1):
         source_message_id = media.get("source_message_id")
         if not source_message_id:
+            logger.error(
+                "Ticket form media has no source message id ticket_id=%s question_id=%s media_index=%s",
+                ticket.id,
+                question.id,
+                media_index,
+            )
             continue
         caption = TicketFormatter.build_media_caption(
             question_number=question_number,
@@ -708,6 +883,15 @@ async def send_ticket_media_to_support(
             )
         except TopicUnavailableError as error:
             logger.error("Failed to copy ticket media because topic is unavailable ticket_id=%s: %s", ticket.id, error)
+
+
+def media_items_can_be_sent_as_group(media_items: list[Any]) -> bool:
+    if len(media_items) < 2:
+        return False
+    return all(
+        media.get("file_id") and media.get("media_type") in MEDIA_GROUP_COMPATIBLE_TYPES
+        for media in media_items
+    )
 
 
 async def send_topic_message(
@@ -730,9 +914,9 @@ async def send_topic_message(
         raise
 
 
-def get_question_reply_markup(question: TicketQuestion) -> Any:
+def get_question_reply_markup(question: TicketQuestion, question_index: int) -> Any:
     if question_accepts_multiple_media(question):
-        return multiple_media_keyboard()
+        return multiple_media_keyboard(question_index)
     return question_keyboard(question.required)
 
 
@@ -740,18 +924,169 @@ def question_accepts_multiple_media(question: TicketQuestion) -> bool:
     return question.allow_multiple and question.answer_type in {ANSWER_TYPE_MEDIA, ANSWER_TYPE_ANY}
 
 
-def append_media_to_current_answer(
-    answers: list[dict[str, Any]],
-    question: TicketQuestion,
+async def buffer_multiple_media_group(
+    message: Message,
+    state: FSMContext,
+    ticket_form_service: TicketFormService,
+    media_item: dict[str, Any],
+) -> None:
+    if message.from_user is None or not message.media_group_id:
+        return
+
+    key = (message.from_user.id, message.media_group_id)
+    async with MEDIA_GROUP_LOCK:
+        cleanup_processed_media_groups()
+        if key in MEDIA_GROUP_PROCESSED_AT:
+            return
+
+        buffer = MEDIA_GROUP_BUFFERS.setdefault(
+            key,
+            {
+                "message": message,
+                "state": state,
+                "ticket_form_service": ticket_form_service,
+                "items": [],
+            },
+        )
+        buffer["items"].append(media_item)
+        if key not in MEDIA_GROUP_TASKS:
+            MEDIA_GROUP_TASKS[key] = asyncio.create_task(flush_multiple_media_group(key))
+
+
+async def flush_multiple_media_group(key: tuple[int, str]) -> None:
+    try:
+        await asyncio.sleep(MEDIA_GROUP_BUFFER_DELAY_SECONDS)
+        async with MEDIA_GROUP_LOCK:
+            buffer = MEDIA_GROUP_BUFFERS.pop(key, None)
+            MEDIA_GROUP_TASKS.pop(key, None)
+            MEDIA_GROUP_PROCESSED_AT[key] = time.monotonic()
+
+        if not buffer:
+            return
+
+        message = buffer["message"]
+        state = buffer["state"]
+        ticket_form_service = buffer["ticket_form_service"]
+        media_items = sorted(
+            buffer["items"],
+            key=lambda item: (parse_optional_int(item.get("sort_order")) or 0, parse_optional_int(item.get("source_message_id")) or 0),
+        )
+        await process_multiple_media_items(
+            message=message,
+            state=state,
+            ticket_form_service=ticket_form_service,
+            media_items=media_items,
+        )
+    except Exception as error:
+        logger.exception("Failed to process media group key=%s: %s", key, error)
+        async with MEDIA_GROUP_LOCK:
+            MEDIA_GROUP_BUFFERS.pop(key, None)
+            MEDIA_GROUP_TASKS.pop(key, None)
+
+
+async def should_process_single_media_group_once(message: Message) -> bool:
+    if message.from_user is None or not message.media_group_id:
+        return True
+
+    key = (message.from_user.id, message.media_group_id)
+    async with MEDIA_GROUP_LOCK:
+        cleanup_processed_media_groups()
+        if key in MEDIA_GROUP_PROCESSED_AT or key in MEDIA_GROUP_BUFFERS:
+            return False
+        MEDIA_GROUP_PROCESSED_AT[key] = time.monotonic()
+        return True
+
+
+async def has_pending_media_group(user_id: int) -> bool:
+    async with MEDIA_GROUP_LOCK:
+        return any(key_user_id == user_id for key_user_id, _ in MEDIA_GROUP_BUFFERS)
+
+
+def cleanup_processed_media_groups() -> None:
+    now = time.monotonic()
+    stale_keys = [
+        key
+        for key, processed_at in MEDIA_GROUP_PROCESSED_AT.items()
+        if now - processed_at > MEDIA_GROUP_PROCESSED_TTL_SECONDS
+    ]
+    for key in stale_keys:
+        MEDIA_GROUP_PROCESSED_AT.pop(key, None)
+
+
+async def process_multiple_media_items(
+    message: Message,
+    state: FSMContext,
+    ticket_form_service: TicketFormService,
+    media_items: list[dict[str, Any]],
+) -> None:
+    data = await state.get_data()
+    form = get_state_form(ticket_form_service, data)
+    if form is None:
+        logger.info("Ignored media group because form state is missing")
+        return
+
+    question_index = int(data.get("question_index", 0))
+    if question_index >= len(form.questions):
+        logger.info("Ignored media group because question state is finished form_id=%s", form.id)
+        return
+
+    question = form.questions[question_index]
+    if not question_accepts_multiple_media(question):
+        logger.info(
+            "Ignored stale media group for non-multiple question form_id=%s question_id=%s",
+            form.id,
+            question.id,
+        )
+        return
+
+    answers = list(data.get("answers", []))
+    current_count = get_current_media_count(answers, question)
+    max_files = question.max_files if question.max_files > 0 else None
+    if max_files is not None and current_count >= max_files:
+        await message.answer(
+            build_multiple_media_limit_text(max_files),
+            reply_markup=multiple_media_keyboard(question_index),
+        )
+        return
+
+    accepted_items = media_items
+    if max_files is not None:
+        accepted_items = media_items[: max_files - current_count]
+
+    for media_item in accepted_items:
+        answers = append_media_to_current_answer(answers, question, media_item)
+
+    if accepted_items:
+        await state.update_data(answers=answers)
+
+    media_count = get_current_media_count(answers, question)
+    limit_reached = max_files is not None and media_count >= max_files
+    await message.answer(
+        build_multiple_media_confirmation_text(media_count, max_files, limit_reached),
+        reply_markup=multiple_media_keyboard(question_index),
+    )
+
+
+def build_media_item(
     raw_answer: dict[str, Any],
     source_message_id: int,
-) -> list[dict[str, Any]]:
-    media_item = {
+    media_group_id: str | None = None,
+) -> dict[str, Any]:
+    return {
         "file_id": raw_answer.get("file_id"),
         "media_type": raw_answer.get("media_type"),
         "caption": raw_answer.get("caption"),
         "source_message_id": source_message_id,
+        "media_group_id": media_group_id,
+        "sort_order": source_message_id,
     }
+
+
+def append_media_to_current_answer(
+    answers: list[dict[str, Any]],
+    question: TicketQuestion,
+    media_item: dict[str, Any],
+) -> list[dict[str, Any]]:
     answer = find_answer_for_question(answers, question.id)
     if answer is None:
         answer = {
@@ -762,7 +1097,9 @@ def append_media_to_current_answer(
             "file_id": media_item["file_id"],
             "media_type": media_item["media_type"],
             "caption": media_item["caption"],
-            "source_message_id": source_message_id,
+            "source_message_id": media_item.get("source_message_id"),
+            "media_group_id": media_item.get("media_group_id"),
+            "sort_order": media_item.get("sort_order"),
             "media_files": [],
             "skipped": False,
         }
@@ -773,8 +1110,65 @@ def append_media_to_current_answer(
         answer["file_id"] = media_item["file_id"]
         answer["media_type"] = media_item["media_type"]
         answer["caption"] = media_item["caption"]
-        answer["source_message_id"] = source_message_id
+        answer["source_message_id"] = media_item.get("source_message_id")
+        answer["media_group_id"] = media_item.get("media_group_id")
+        answer["sort_order"] = media_item.get("sort_order")
     return answers
+
+
+def build_multiple_media_confirmation_text(
+    media_count: int,
+    max_files: int | None,
+    limit_reached: bool = False,
+) -> str:
+    if max_files is None:
+        return (
+            f"Файлы добавлены: {media_count}.\n"
+            "Можно отправить ещё файл или нажать «Продолжить»."
+        )
+    if limit_reached:
+        return (
+            f"Файлы добавлены: {media_count} из {max_files}.\n"
+            "Достигнут лимит файлов.\n\n"
+            "Нажмите «Продолжить», чтобы перейти дальше."
+        )
+    return (
+        f"Файлы добавлены: {media_count} из {max_files}.\n"
+        "Можно отправить ещё файл или нажать «Продолжить»."
+    )
+
+
+def build_multiple_media_limit_text(max_files: int) -> str:
+    return (
+        f"Достигнут лимит файлов: {max_files}.\n"
+        "Нажмите «Продолжить», чтобы перейти дальше."
+    )
+
+
+def parse_optional_int(value: Any) -> int | None:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_continue_media_question_index(callback_data: str | None) -> int | None:
+    if not callback_data or ":" not in callback_data:
+        return None
+    prefix, raw_index = callback_data.split(":", maxsplit=1)
+    if prefix != CALLBACK_CONTINUE_MEDIA:
+        return None
+    return parse_optional_int(raw_index)
+
+
+def get_continue_media_lock(user_id: int) -> asyncio.Lock:
+    lock = CONTINUE_MEDIA_LOCKS.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        CONTINUE_MEDIA_LOCKS[user_id] = lock
+    return lock
 
 
 def get_current_media_count(answers: list[dict[str, Any]], question: TicketQuestion) -> int:
