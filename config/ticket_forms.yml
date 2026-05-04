@@ -22,7 +22,7 @@ forms:
       - id: "last_login"
         text: "Когда вы примерно последний раз заходили на сервер?"
         help_text: "Например: вчера вечером, неделю назад, 15 апреля."
-        required: false
+        required: true
         answer_type: "text"
 
       - id: "proof"
