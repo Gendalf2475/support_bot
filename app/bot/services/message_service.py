@@ -157,9 +157,14 @@ class MessageService:
         user: User,
         ticket: Ticket,
         source_message_id: int,
+        caption: str | None = None,
     ) -> int | None:
         if not ticket.topic_id:
             raise TopicUnavailableError("Ticket has no topic_id")
+
+        copy_kwargs = {}
+        if caption is not None:
+            copy_kwargs["caption"] = caption
 
         try:
             copy_result = await bot.copy_message(
@@ -167,6 +172,7 @@ class MessageService:
                 from_chat_id=user.telegram_id,
                 message_id=source_message_id,
                 message_thread_id=ticket.topic_id,
+                **copy_kwargs,
             )
         except TelegramBadRequest as error:
             if self.is_topic_unavailable_error(error):
