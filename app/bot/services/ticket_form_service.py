@@ -23,6 +23,8 @@ class TicketQuestion:
     required: bool
     answer_type: str = ANSWER_TYPE_ANY
     help_text: str | None = None
+    allow_multiple: bool = False
+    max_files: int = 1
 
 
 @dataclass(frozen=True)
@@ -102,6 +104,8 @@ class TicketFormService:
         if not isinstance(raw_form, dict):
             logger.error("Ticket form #%s must be an object. Form is skipped.", index)
             return None
+        if raw_form.get("enabled", True) is False:
+            return None
 
         form_id = str(raw_form.get("id") or "").strip()
         title = str(raw_form.get("title") or "").strip()
@@ -158,6 +162,8 @@ class TicketFormService:
             help_text = str(raw_question.get("help_text") or "").strip() or None
             required = bool(raw_question.get("required", False))
             answer_type = str(raw_question.get("answer_type") or ANSWER_TYPE_ANY).strip().lower()
+            allow_multiple = bool(raw_question.get("allow_multiple", False))
+            max_files = self._parse_max_files(raw_question.get("max_files"), allow_multiple)
 
             if not question_id:
                 logger.error("Question #%s in form '%s' has empty id. Question is skipped.", index, form_label)
@@ -184,11 +190,23 @@ class TicketFormService:
                     required=required,
                     answer_type=answer_type,
                     help_text=help_text,
+                    allow_multiple=allow_multiple,
+                    max_files=max_files,
                 )
             )
             used_ids.add(question_id)
 
         return questions
+
+    @staticmethod
+    def _parse_max_files(raw_value: Any, allow_multiple: bool) -> int:
+        if not allow_multiple:
+            return 1
+        try:
+            max_files = int(raw_value or 5)
+        except (TypeError, ValueError):
+            max_files = 5
+        return max(1, min(max_files, 20))
 
     @staticmethod
     def fallback_form() -> TicketForm:

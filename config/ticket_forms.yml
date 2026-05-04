@@ -15,21 +15,23 @@ forms:
 
       - id: "server"
         text: "На каком режиме вы играли?"
-        help_text: "Например: Survival, TechnoMagic, Anarchy или другой режим."
+        help_text: "Например: Polit, Survival или другой режим."
         required: true
         answer_type: "text"
 
       - id: "last_login"
         text: "Когда вы примерно последний раз заходили на сервер?"
         help_text: "Например: вчера вечером, неделю назад, 15 апреля."
-        required: true
+        required: false
         answer_type: "text"
 
       - id: "proof"
         text: "Прикрепите доказательства владения аккаунтом, если есть:"
-        help_text: "Можно отправить скриншот, чек покупки, старые скриншоты аккаунта или другое подтверждение."
+        help_text: "Можно отправить до 5 файлов: фото, видео или документы."
         required: false
         answer_type: "media"
+        allow_multiple: true
+        max_files: 5
 
   - id: "player_report"
     title: "Жалоба на игрока"
@@ -57,39 +59,11 @@ forms:
 
       - id: "proof"
         text: "Прикрепите доказательства:"
-        help_text: "Можно отправить скриншот, видео, документ или ссылку."
+        help_text: "Можно отправить до 5 файлов: фото, видео или документы."
         required: true
-        answer_type: "any"
-
-  - id: "donation_problem"
-    title: "Проблема с донатом"
-    description: "Форма для проблем с покупками"
-    button_text: "💳 Проблема с донатом"
-    admin_title: "Проблема с донатом"
-    questions:
-      - id: "nickname"
-        text: "Введите ваш игровой ник:"
-        help_text: "Ник нужен для проверки покупки."
-        required: true
-        answer_type: "text"
-
-      - id: "purchase"
-        text: "Что именно вы покупали?"
-        help_text: "Например: привилегию, кейсы, валюту или другой товар."
-        required: true
-        answer_type: "text"
-
-      - id: "payment_time"
-        text: "Когда примерно была оплата?"
-        help_text: "Например: сегодня в 15:30 или вчера вечером."
-        required: false
-        answer_type: "text"
-
-      - id: "receipt"
-        text: "Прикрепите чек или скриншот оплаты:"
-        help_text: "Если чека нет, нажмите «Пропустить»."
-        required: false
         answer_type: "media"
+        allow_multiple: true
+        max_files: 5
 
   - id: "other"
     title: "Другое"

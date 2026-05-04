@@ -6,12 +6,15 @@ from datetime import timedelta
 from typing import Any
 
 from aiogram import Bot
+from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
+from aiogram.types import ReplyKeyboardRemove
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.bot.database.models import Ticket, TicketAnswer, TicketStatus, User, utcnow
+from app.bot.database.models import Ticket, TicketAnswer, TicketAnswerMedia, TicketStatus, User, utcnow
+from app.bot.services.ticket_formatter import TicketFormatter
 from app.bot.services.ticket_form_service import TicketForm
 
 
@@ -50,7 +53,7 @@ class TicketService:
         statement = (
             select(Ticket)
             .where(Ticket.user_id == user_id, Ticket.status == TicketStatus.OPEN)
-            .options(selectinload(Ticket.answers))
+            .options(selectinload(Ticket.answers).selectinload(TicketAnswer.media_files))
             .order_by(Ticket.created_at.desc())
             .limit(1)
         )
@@ -60,7 +63,7 @@ class TicketService:
         statement = (
             select(Ticket)
             .where(Ticket.topic_id == topic_id, Ticket.status == TicketStatus.OPEN)
-            .options(selectinload(Ticket.answers))
+            .options(selectinload(Ticket.answers).selectinload(TicketAnswer.media_files))
             .order_by(Ticket.created_at.desc())
             .limit(1)
         )
@@ -70,7 +73,7 @@ class TicketService:
         statement = (
             select(Ticket)
             .where(Ticket.id == ticket_id)
-            .options(selectinload(Ticket.answers))
+            .options(selectinload(Ticket.answers).selectinload(TicketAnswer.media_files))
         )
         return await self.session.scalar(statement)
 
@@ -85,7 +88,7 @@ class TicketService:
         ticket = Ticket(
             user_id=user.id,
             form_id=form.id,
-            form_title=form.title,
+            form_title=form.admin_title,
             status=TicketStatus.OPEN,
             topic_id=topic_id,
             created_at=now,
@@ -108,7 +111,7 @@ class TicketService:
         ticket = Ticket(
             user_id=user.id,
             form_id=form.id,
-            form_title=form.title,
+            form_title=form.admin_title,
             status=TicketStatus.CANCELLED,
             topic_id=user.topic_id,
         )
@@ -123,6 +126,33 @@ class TicketService:
         ticket.topic_id = topic_id
         await self.session.flush()
 
+    async def set_card_message_id(self, ticket: Ticket, message_id: int) -> None:
+        ticket.card_message_id = message_id
+        await self.session.flush()
+
+    async def set_control_message_id(self, ticket: Ticket, message_id: int) -> None:
+        ticket.control_message_id = message_id
+        await self.session.flush()
+
+    async def pin_ticket_card(self, bot: Bot, ticket: Ticket) -> None:
+        if not ticket.card_message_id:
+            return
+
+        try:
+            await bot.pin_chat_message(
+                chat_id=self.support_chat_id,
+                message_id=ticket.card_message_id,
+                disable_notification=True,
+            )
+        except TelegramAPIError as error:
+            logger.error(
+                "Failed to pin ticket card ticket_id=%s topic_id=%s card_message_id=%s: %s",
+                ticket.id,
+                ticket.topic_id,
+                ticket.card_message_id,
+                error,
+            )
+
     async def mark_user_activity(self, ticket: Ticket) -> None:
         ticket.last_user_message_at = utcnow()
         await self.session.flush()
@@ -134,6 +164,7 @@ class TicketService:
         reason: str,
         closed_by_telegram_id: int | None = None,
         auto_close_after_days: int | None = None,
+        ticket_forms: list[TicketForm] | None = None,
     ) -> bool:
         if ticket.status != TicketStatus.OPEN:
             return False
@@ -156,20 +187,32 @@ class TicketService:
                     chat_id=self.support_chat_id,
                     message_thread_id=topic_id,
                     text=topic_text,
+                    reply_markup=ReplyKeyboardRemove(),
                 )
             except TelegramAPIError as error:
                 logger.error("Failed to send ticket closed notice ticket_id=%s topic_id=%s: %s", ticket.id, topic_id, error)
 
         if user:
             try:
+                reply_markup = None
+                if not user.blocked and ticket_forms:
+                    from app.bot.keyboards import ticket_forms_reply_keyboard
+
+                    reply_markup = ticket_forms_reply_keyboard(ticket_forms)
+
                 await bot.send_message(
                     chat_id=user.telegram_id,
                     text=self.build_user_close_text(reason, auto_close_after_days),
+                    reply_markup=reply_markup,
                 )
             except TelegramAPIError as error:
                 logger.error("Failed to notify user about closed ticket ticket_id=%s telegram_id=%s: %s", ticket.id, user.telegram_id, error)
                 if topic_id:
                     await self.notify_support_about_user_notification_error(bot, topic_id)
+
+        if user:
+            await self.update_ticket_card(bot, ticket, user)
+        await self.update_ticket_control_message(bot, ticket)
 
         logger.info(
             "Closed ticket id=%s by telegram_id=%s reason=%s",
@@ -219,7 +262,12 @@ class TicketService:
         await self.session.flush()
         return sent_count
 
-    async def auto_close_inactive_tickets(self, bot: Bot, auto_close_after_days: int) -> int:
+    async def auto_close_inactive_tickets(
+        self,
+        bot: Bot,
+        auto_close_after_days: int,
+        ticket_forms: list[TicketForm] | None = None,
+    ) -> int:
         now = utcnow()
         inactive_before = now - timedelta(days=auto_close_after_days)
         statement = (
@@ -234,7 +282,7 @@ class TicketService:
                     ),
                 ),
             )
-            .options(selectinload(Ticket.answers))
+            .options(selectinload(Ticket.answers).selectinload(TicketAnswer.media_files))
         )
         tickets = list((await self.session.scalars(statement)).all())
         closed_count = 0
@@ -246,6 +294,7 @@ class TicketService:
                     reason=AUTO_NO_USER_RESPONSE_REASON,
                     closed_by_telegram_id=None,
                     auto_close_after_days=auto_close_after_days,
+                    ticket_forms=ticket_forms,
                 )
             except Exception as error:
                 logger.exception("Failed to auto-close ticket_id=%s: %s", ticket.id, error)
@@ -256,24 +305,78 @@ class TicketService:
         return closed_count
 
     def _add_answers(self, ticket: Ticket, form: TicketForm, answers: list[dict[str, Any]]) -> None:
-        answer_by_question = {answer.get("question_id"): answer for answer in answers}
-        for question in form.questions:
-            answer = answer_by_question.get(question.id)
-            if answer is None:
-                continue
+        answers_by_question: dict[str, list[dict[str, Any]]] = {}
+        for answer in answers:
+            question_id = answer.get("question_id")
+            if question_id:
+                answers_by_question.setdefault(str(question_id), []).append(answer)
 
-            self.session.add(
-                TicketAnswer(
+        for question in form.questions:
+            for answer in answers_by_question.get(question.id, []):
+                media_files = self.extract_media_files(answer)
+                first_media = media_files[0] if media_files else None
+                ticket_answer = TicketAnswer(
                     ticket_id=ticket.id,
                     question_id=question.id,
                     question_text=question.text,
                     answer_type=str(answer.get("answer_type") or "text"),
                     answer_text=answer.get("answer_text"),
-                    file_id=answer.get("file_id"),
-                    media_type=answer.get("media_type"),
-                    caption=answer.get("caption"),
+                    file_id=first_media.get("file_id") if first_media else answer.get("file_id"),
+                    media_type=first_media.get("media_type") if first_media else answer.get("media_type"),
+                    caption=first_media.get("caption") if first_media else answer.get("caption"),
                     skipped=bool(answer.get("skipped", False)),
                 )
+                for media in media_files:
+                    ticket_answer.media_files.append(
+                        TicketAnswerMedia(
+                            file_id=str(media.get("file_id") or ""),
+                            media_type=str(media.get("media_type") or "media"),
+                            caption=media.get("caption"),
+                        )
+                    )
+                self.session.add(ticket_answer)
+
+    async def update_ticket_card(self, bot: Bot, ticket: Ticket, user: User) -> None:
+        if not ticket.card_message_id:
+            return
+
+        close_reason_label = None
+        if ticket.close_reason:
+            close_reason_label = self.get_close_reason_label(ticket.close_reason)
+
+        try:
+            await bot.edit_message_text(
+                chat_id=self.support_chat_id,
+                message_id=ticket.card_message_id,
+                text=TicketFormatter.build_ticket_parts(ticket, user, close_reason_label)[0],
+                parse_mode=ParseMode.HTML,
+            )
+        except TelegramAPIError as error:
+            logger.error(
+                "Failed to update ticket card ticket_id=%s topic_id=%s card_message_id=%s: %s",
+                ticket.id,
+                ticket.topic_id,
+                ticket.card_message_id,
+                error,
+            )
+
+    async def update_ticket_control_message(self, bot: Bot, ticket: Ticket) -> None:
+        if not ticket.control_message_id:
+            return
+
+        try:
+            await bot.edit_message_text(
+                chat_id=self.support_chat_id,
+                message_id=ticket.control_message_id,
+                text=TicketFormatter.build_closed_control_text(ticket.id),
+            )
+        except TelegramAPIError as error:
+            logger.error(
+                "Failed to update ticket control message ticket_id=%s topic_id=%s control_message_id=%s: %s",
+                ticket.id,
+                ticket.topic_id,
+                ticket.control_message_id,
+                error,
             )
 
     @staticmethod
@@ -316,18 +419,15 @@ class TicketService:
             lines.append(f"{label}:")
 
             if answer is None:
-                lines.append("не указано")
+                lines.append("— Пропущено")
             elif answer.get("skipped"):
                 lines.append("пропущено")
             elif answer.get("answer_type") == "media":
-                media_type = answer.get("media_type") or "media"
-                caption = answer.get("caption")
-                if for_admin:
-                    lines.append("Медиа прикреплено ниже.")
+                media_count = len(TicketService.extract_media_files(answer))
+                if media_count:
+                    lines.append(f"📎 Медиафайлов: {media_count}")
                 else:
-                    lines.append(f"Медиа: {media_type}")
-                if caption:
-                    lines.append(f"Caption: {caption}")
+                    lines.append("— Пропущено")
             else:
                 lines.append(str(answer.get("answer_text") or "не указано"))
 
@@ -335,6 +435,26 @@ class TicketService:
         if lines and lines[-1] == "":
             lines.pop()
         return lines
+
+    @staticmethod
+    def extract_media_files(answer: dict[str, Any]) -> list[dict[str, Any]]:
+        raw_media_files = answer.get("media_files")
+        if isinstance(raw_media_files, list):
+            return [
+                media
+                for media in raw_media_files
+                if isinstance(media, dict) and media.get("file_id")
+            ]
+        if answer.get("file_id"):
+            return [
+                {
+                    "file_id": answer.get("file_id"),
+                    "media_type": answer.get("media_type"),
+                    "caption": answer.get("caption"),
+                    "source_message_id": answer.get("source_message_id"),
+                }
+            ]
+        return []
 
     @staticmethod
     def get_close_reason_label(reason: str) -> str:
@@ -362,14 +482,14 @@ class TicketService:
             return (
                 "✅ Ваш тикет был автоматически закрыт, так как в нём не было активности "
                 f"больше {days} дней.\n"
-                "Если вопрос ещё актуален, вы можете открыть новый тикет."
+                "Если вопрос ещё актуален, выберите тип обращения ниже."
             )
 
         label = TicketService.get_close_reason_label(reason)
         return (
             "✅ Ваш тикет был закрыт администрацией.\n"
             f"Причина: {label}.\n\n"
-            "Если у вас появится новый вопрос, вы можете открыть новый тикет."
+            "Если у вас появится новый вопрос, выберите тип обращения ниже."
         )
 
     async def notify_support_about_user_notification_error(self, bot: Bot, topic_id: int) -> None:

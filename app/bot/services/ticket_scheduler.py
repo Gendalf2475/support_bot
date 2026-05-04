@@ -7,6 +7,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.bot.config import Settings
+from app.bot.services.ticket_form_service import TicketFormService
 from app.bot.services.ticket_service import TicketService
 
 
@@ -19,10 +20,12 @@ class TicketMaintenanceScheduler:
         bot: Bot,
         sessionmaker: async_sessionmaker[AsyncSession],
         settings: Settings,
+        ticket_form_service: TicketFormService,
     ) -> None:
         self.bot = bot
         self.sessionmaker = sessionmaker
         self.settings = settings
+        self.ticket_form_service = ticket_form_service
         self.scheduler = AsyncIOScheduler(timezone="UTC")
 
     def start(self) -> None:
@@ -66,6 +69,7 @@ class TicketMaintenanceScheduler:
                     tickets_closed = await ticket_service.auto_close_inactive_tickets(
                         bot=self.bot,
                         auto_close_after_days=self.settings.ticket_auto_close_after_days,
+                        ticket_forms=self.ticket_form_service.get_forms() if self.ticket_form_service.enabled else None,
                     )
                     if tickets_closed:
                         logger.info("Inactive tickets auto-closed count=%s", tickets_closed)

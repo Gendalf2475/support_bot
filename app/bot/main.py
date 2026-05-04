@@ -33,7 +33,7 @@ async def main() -> None:
 
     sessionmaker = create_sessionmaker(settings.database_url)
     ticket_form_service = TicketFormService(settings.ticket_forms_path)
-    ticket_scheduler = TicketMaintenanceScheduler(bot, sessionmaker, settings)
+    ticket_scheduler = TicketMaintenanceScheduler(bot, sessionmaker, settings, ticket_form_service)
 
     dispatcher["settings"] = settings
     dispatcher["ticket_form_service"] = ticket_form_service

@@ -73,6 +73,8 @@ class Ticket(Base):
         default=TicketStatus.OPEN,
     )
     topic_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True)
+    card_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    control_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     close_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
     last_user_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_reminded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -90,6 +92,7 @@ class Ticket(Base):
     answers: Mapped[list[TicketAnswer]] = relationship(
         back_populates="ticket",
         cascade="all, delete-orphan",
+        order_by="TicketAnswer.id",
     )
     messages: Mapped[list[MessageMap]] = relationship(back_populates="ticket")
 
@@ -110,6 +113,28 @@ class TicketAnswer(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
     ticket: Mapped[Ticket] = relationship(back_populates="answers")
+    media_files: Mapped[list[TicketAnswerMedia]] = relationship(
+        back_populates="answer",
+        cascade="all, delete-orphan",
+        order_by="TicketAnswerMedia.id",
+    )
+
+
+class TicketAnswerMedia(Base):
+    __tablename__ = "ticket_answer_media"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ticket_answer_id: Mapped[int] = mapped_column(
+        ForeignKey("ticket_answers.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+    file_id: Mapped[str] = mapped_column(String(512), nullable=False)
+    media_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    caption: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    answer: Mapped[TicketAnswer] = relationship(back_populates="media_files")
 
 
 class MessageMap(Base):

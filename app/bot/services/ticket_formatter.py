@@ -6,7 +6,7 @@ from datetime import datetime
 from html import escape
 from typing import Any
 
-from app.bot.database.models import Ticket, TicketAnswer, TicketStatus, User
+from app.bot.database.models import Ticket, TicketAnswer, TicketAnswerMedia, TicketStatus, User
 from app.bot.services.ticket_form_service import TicketForm, TicketQuestion
 
 
@@ -70,13 +70,18 @@ class TicketFormatter:
         cls,
         question_number: int,
         question_text: str,
+        media_index: int,
+        media_total: int,
         user_caption: str | None,
         media_type: str | None,
     ) -> str | None:
         if media_type == "sticker":
             return None
 
-        title = f"📎 Вопрос {question_number}: {cls._clean_label(question_text)}"
+        title = (
+            f"📎 Вопрос {question_number}: {cls._clean_label(question_text)}\n"
+            f"Файл {media_index} из {media_total}"
+        )
         caption = (user_caption or "").strip()
         if not caption:
             return cls._limit_caption(title)
@@ -91,12 +96,15 @@ class TicketFormatter:
         cls,
         form: TicketForm,
         answers: Sequence[Mapping[str, Any]],
-    ) -> Iterable[tuple[int, TicketQuestion, Mapping[str, Any]]]:
+    ) -> Iterable[tuple[int, TicketQuestion, int, int, Mapping[str, Any]]]:
         answers_by_question = cls._group_mapping_answers(answers)
         for question_number, question in enumerate(form.questions, start=1):
+            media_items: list[Mapping[str, Any]] = []
             for answer in answers_by_question.get(question.id, []):
-                if cls._is_media_answer(answer):
-                    yield question_number, question, answer
+                media_items.extend(cls._get_media_items(answer))
+            media_total = len(media_items)
+            for media_index, media in enumerate(media_items, start=1):
+                yield question_number, question, media_index, media_total, media
 
     @classmethod
     def _build_card_parts(
@@ -223,12 +231,9 @@ class TicketFormatter:
         if cls._get_answer_value(answer, "skipped"):
             return ["— Пропущено"]
 
-        if cls._is_media_answer(answer):
-            lines = ["📎 Медиа прикреплено ниже"]
-            caption = cls._get_answer_value(answer, "caption")
-            if caption:
-                lines.append(f"Подпись: {cls._e(str(caption))}")
-            return lines
+        media_count = cls._get_media_count(answer)
+        if media_count:
+            return [f"📎 Медиафайлов: {media_count}"]
 
         answer_text = str(cls._get_answer_value(answer, "answer_text") or "").strip()
         if not answer_text:
@@ -286,13 +291,31 @@ class TicketFormatter:
 
     @classmethod
     def _is_media_answer(cls, answer: TicketAnswer | Mapping[str, Any]) -> bool:
-        return bool(
-            cls._get_answer_value(answer, "file_id")
-            or cls._get_answer_value(answer, "answer_type") == "media"
-        )
+        return cls._get_media_count(answer) > 0
+
+    @classmethod
+    def _get_media_count(cls, answer: TicketAnswer | Mapping[str, Any]) -> int:
+        if isinstance(answer, Mapping):
+            media_files = answer.get("media_files")
+            if isinstance(media_files, Sequence) and not isinstance(media_files, (str, bytes)):
+                return len(media_files)
+            return 1 if answer.get("file_id") else 0
+
+        if answer.media_files:
+            return len(answer.media_files)
+        return 1 if answer.file_id else 0
 
     @staticmethod
-    def _get_answer_value(answer: TicketAnswer | Mapping[str, Any], key: str) -> Any:
+    def _get_media_items(answer: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+        media_files = answer.get("media_files")
+        if isinstance(media_files, Sequence) and not isinstance(media_files, (str, bytes)):
+            return [media for media in media_files if isinstance(media, Mapping)]
+        if answer.get("file_id"):
+            return [answer]
+        return []
+
+    @staticmethod
+    def _get_answer_value(answer: TicketAnswer | TicketAnswerMedia | Mapping[str, Any], key: str) -> Any:
         if isinstance(answer, Mapping):
             return answer.get(key)
         return getattr(answer, key)

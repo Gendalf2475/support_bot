@@ -7,8 +7,9 @@ from aiogram.types import Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot.config import Settings
+from app.bot.keyboards import SUPPORT_CLOSE_TICKET_TEXT
 from app.bot.services.message_service import MessageService
-from app.bot.services.ticket_service import TicketService
+from app.bot.services.ticket_service import CLOSE_REASONS, MANUAL_CLOSE_REASON_CODES, TicketService
 from app.bot.services.user_service import UserService
 
 
@@ -76,7 +77,12 @@ def is_bot_message(message: Message) -> bool:
 
 def is_command_message(message: Message) -> bool:
     text = MessageService.extract_text_or_caption(message)
-    return bool(text and text.lstrip().startswith("/"))
+    if not text:
+        return False
+    stripped_text = text.strip()
+    support_system_texts = {SUPPORT_CLOSE_TICKET_TEXT}
+    support_system_texts.update(CLOSE_REASONS[reason_code].button_text for reason_code in MANUAL_CLOSE_REASON_CODES)
+    return stripped_text.startswith("/") or stripped_text in support_system_texts
 
 
 def is_regular_supported_message(message: Message) -> bool:

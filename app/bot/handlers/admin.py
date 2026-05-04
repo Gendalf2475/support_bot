@@ -4,10 +4,10 @@ import logging
 from datetime import datetime
 
 from aiogram import Bot, F, Router
-from aiogram.enums import ChatMemberStatus
+from aiogram.enums import ChatMemberStatus, ChatType
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot.config import Settings
@@ -17,8 +17,11 @@ from app.bot.keyboards import (
     CALLBACK_CLOSE_REASON_PREFIX,
     close_reason_keyboard,
     closed_ticket_keyboard,
+    SUPPORT_CLOSE_TICKET_TEXT,
+    support_close_reason_keyboard,
 )
-from app.bot.services.ticket_service import MANUAL_CLOSE_REASON_CODES, TicketService
+from app.bot.services.ticket_form_service import TicketFormService
+from app.bot.services.ticket_service import CLOSE_REASONS, MANUAL_CLOSE_REASON_CODES, TicketService
 from app.bot.services.user_service import UserService
 
 
@@ -104,7 +107,74 @@ async def close_ticket_by_command(message: Message, bot: Bot, session: AsyncSess
         await message.answer("В этом топике нет открытого тикета.")
         return
 
-    await message.answer("Выберите причину закрытия тикета:", reply_markup=close_reason_keyboard(ticket.id))
+    await prompt_close_reason(message, ticket)
+
+
+@router.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}), F.text == SUPPORT_CLOSE_TICKET_TEXT)
+async def close_ticket_by_keyboard(message: Message, bot: Bot, session: AsyncSession, settings: Settings) -> None:
+    if message.chat.id != settings.support_chat_id:
+        return
+    if message.message_thread_id is None:
+        await message.answer("Кнопка закрытия работает только внутри топика тикета.")
+        return
+    if message.from_user is None:
+        await message.answer("Не удалось определить, кто закрывает тикет.")
+        return
+    if not await is_support_chat_member(bot, settings.support_chat_id, message.from_user.id):
+        await message.answer("Закрывать тикеты могут только участники группы поддержки.")
+        return
+
+    ticket = await TicketService(session, settings.support_chat_id).get_open_ticket_by_topic_id(message.message_thread_id)
+    if ticket is None:
+        await message.answer("Нет открытого тикета для закрытия.", reply_markup=ReplyKeyboardRemove())
+        return
+
+    await prompt_close_reason(message, ticket)
+
+
+@router.message(
+    F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
+    F.text.in_([CLOSE_REASONS[reason_code].button_text for reason_code in MANUAL_CLOSE_REASON_CODES]),
+)
+async def close_ticket_by_reason_keyboard(
+    message: Message,
+    bot: Bot,
+    session: AsyncSession,
+    settings: Settings,
+    ticket_form_service: TicketFormService,
+) -> None:
+    if message.chat.id != settings.support_chat_id:
+        return
+    if message.message_thread_id is None:
+        await message.answer("Причину закрытия можно выбрать только внутри топика тикета.")
+        return
+    if message.from_user is None:
+        await message.answer("Не удалось определить, кто закрывает тикет.")
+        return
+    if not await is_support_chat_member(bot, settings.support_chat_id, message.from_user.id):
+        await message.answer("Закрывать тикеты могут только участники группы поддержки.")
+        return
+
+    reason = get_close_reason_code_by_button_text(message.text or "")
+    if reason is None:
+        return
+
+    ticket_service = TicketService(session, settings.support_chat_id)
+    ticket = await ticket_service.get_open_ticket_by_topic_id(message.message_thread_id)
+    if ticket is None:
+        await message.answer("Нет открытого тикета для закрытия.", reply_markup=ReplyKeyboardRemove())
+        return
+
+    closed = await close_ticket(
+        bot=bot,
+        ticket_service=ticket_service,
+        ticket=ticket,
+        closed_by_telegram_id=message.from_user.id,
+        reason=reason,
+        ticket_form_service=ticket_form_service,
+    )
+    if not closed:
+        await message.answer("Тикет уже закрыт.")
 
 
 @router.callback_query(F.data.startswith(CALLBACK_CLOSE_PREFIX))
@@ -165,6 +235,7 @@ async def close_ticket_with_reason(
     bot: Bot,
     session: AsyncSession,
     settings: Settings,
+    ticket_form_service: TicketFormService,
 ) -> None:
     message = callback.message
     if not isinstance(message, Message):
@@ -194,7 +265,7 @@ async def close_ticket_with_reason(
         return
 
     assert ticket is not None
-    closed = await close_ticket(bot, ticket_service, ticket, callback.from_user.id, reason)
+    closed = await close_ticket(bot, ticket_service, ticket, callback.from_user.id, reason, ticket_form_service)
     if not closed:
         await callback.answer("Тикет уже закрыт.", show_alert=True)
         return
@@ -237,12 +308,32 @@ async def close_ticket(
     ticket: Ticket,
     closed_by_telegram_id: int,
     reason: str,
+    ticket_form_service: TicketFormService,
 ) -> bool:
     return await ticket_service.close_ticket(
         bot=bot,
         ticket=ticket,
         reason=reason,
         closed_by_telegram_id=closed_by_telegram_id,
+        ticket_forms=ticket_form_service.get_forms() if ticket_form_service.enabled else None,
+    )
+
+
+async def prompt_close_reason(message: Message, ticket: Ticket) -> None:
+    await message.answer(
+        f"Выберите причину закрытия тикета #{ticket.id}:",
+        reply_markup=support_close_reason_keyboard(),
+    )
+
+
+def get_close_reason_code_by_button_text(text: str) -> str | None:
+    return next(
+        (
+            reason_code
+            for reason_code in MANUAL_CLOSE_REASON_CODES
+            if CLOSE_REASONS[reason_code].button_text == text
+        ),
+        None,
     )
 
 
