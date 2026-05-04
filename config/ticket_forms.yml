@@ -1,0 +1,104 @@
+enabled: true
+
+forms:
+  - id: "forgot_password"
+    title: "Забыл пароль"
+    description: "Форма для восстановления доступа к аккаунту"
+    button_text: "🔐 Забыл пароль"
+    admin_title: "Заявка на восстановление пароля"
+    questions:
+      - id: "nickname"
+        text: "Введите ваш игровой ник:"
+        help_text: "Укажите ник точно так же, как он отображается на сервере."
+        required: true
+        answer_type: "text"
+
+      - id: "server"
+        text: "На каком режиме вы играли?"
+        help_text: "Например: Survival, TechnoMagic, Anarchy или другой режим."
+        required: true
+        answer_type: "text"
+
+      - id: "last_login"
+        text: "Когда вы примерно последний раз заходили на сервер?"
+        help_text: "Например: вчера вечером, неделю назад, 15 апреля."
+        required: false
+        answer_type: "text"
+
+      - id: "proof"
+        text: "Прикрепите доказательства владения аккаунтом, если есть:"
+        help_text: "Можно отправить скриншот, чек покупки, старые скриншоты аккаунта или другое подтверждение."
+        required: false
+        answer_type: "media"
+
+  - id: "player_report"
+    title: "Жалоба на игрока"
+    description: "Форма для жалобы на нарушителя"
+    button_text: "🚨 Жалоба на игрока"
+    admin_title: "Жалоба на игрока"
+    questions:
+      - id: "your_nickname"
+        text: "Введите ваш игровой ник:"
+        help_text: "Укажите ник точно так же, как он отображается на сервере."
+        required: true
+        answer_type: "text"
+
+      - id: "violator_nickname"
+        text: "Введите ник нарушителя:"
+        help_text: "Если нарушителей несколько, укажите их через запятую."
+        required: true
+        answer_type: "text"
+
+      - id: "reason"
+        text: "Опишите нарушение:"
+        help_text: "Опишите ситуацию подробно: что произошло, где и когда."
+        required: true
+        answer_type: "text"
+
+      - id: "proof"
+        text: "Прикрепите доказательства:"
+        help_text: "Можно отправить скриншот, видео, документ или ссылку."
+        required: true
+        answer_type: "any"
+
+  - id: "donation_problem"
+    title: "Проблема с донатом"
+    description: "Форма для проблем с покупками"
+    button_text: "💳 Проблема с донатом"
+    admin_title: "Проблема с донатом"
+    questions:
+      - id: "nickname"
+        text: "Введите ваш игровой ник:"
+        help_text: "Ник нужен для проверки покупки."
+        required: true
+        answer_type: "text"
+
+      - id: "purchase"
+        text: "Что именно вы покупали?"
+        help_text: "Например: привилегию, кейсы, валюту или другой товар."
+        required: true
+        answer_type: "text"
+
+      - id: "payment_time"
+        text: "Когда примерно была оплата?"
+        help_text: "Например: сегодня в 15:30 или вчера вечером."
+        required: false
+        answer_type: "text"
+
+      - id: "receipt"
+        text: "Прикрепите чек или скриншот оплаты:"
+        help_text: "Если чека нет, нажмите «Пропустить»."
+        required: false
+        answer_type: "media"
+
+  - id: "other"
+    title: "Другое"
+    description: "Свободное обращение в поддержку"
+    button_text: "💬 Другое"
+    admin_title: "Другое обращение"
+    questions:
+      - id: "message"
+        text: "Опишите вашу проблему:"
+        help_text: "Постарайтесь описать ситуацию максимально подробно."
+        required: true
+        answer_type: "any"

@@ -1,0 +1,36 @@
+from functools import lru_cache
+from pathlib import Path
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+class Settings(BaseSettings):
+    bot_token: str = Field(..., alias="BOT_TOKEN")
+    support_chat_id: int = Field(..., alias="SUPPORT_CHAT_ID")
+    database_url: str = Field(
+        "sqlite+aiosqlite:///support_bot.db",
+        alias="DATABASE_URL",
+    )
+    log_level: str = Field("INFO", alias="LOG_LEVEL")
+    ticket_forms_path: Path = PROJECT_ROOT / "config" / "ticket_forms.yml"
+    ticket_reminder_enabled: bool = Field(True, alias="TICKET_REMINDER_ENABLED")
+    ticket_reminder_after_hours: int = Field(24, alias="TICKET_REMINDER_AFTER_HOURS")
+    ticket_reminder_interval_minutes: int = Field(60, alias="TICKET_REMINDER_INTERVAL_MINUTES")
+    ticket_check_interval_minutes: int = Field(10, alias="TICKET_CHECK_INTERVAL_MINUTES")
+    ticket_auto_close_enabled: bool = Field(True, alias="TICKET_AUTO_CLOSE_ENABLED")
+    ticket_auto_close_after_days: int = Field(7, alias="TICKET_AUTO_CLOSE_AFTER_DAYS")
+
+    model_config = SettingsConfigDict(
+        env_file=PROJECT_ROOT / ".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
