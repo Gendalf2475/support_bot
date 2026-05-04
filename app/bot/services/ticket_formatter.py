@@ -194,7 +194,7 @@ class TicketFormatter:
 
     @classmethod
     def _build_header(cls, ticket_id: int, form_title: str, user: User) -> str:
-        username = f"@{user.username}" if user.username else "нет username"
+        username = f"@{str(user.username).strip('@')}" if user.username else "нет username"
         full_name = user.full_name or "не указано"
         return "\n".join(
             [

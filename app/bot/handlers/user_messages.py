@@ -116,13 +116,14 @@ async def open_ticket(
     session: AsyncSession,
     settings: Settings,
     ticket_form_service: TicketFormService,
+    known_user: User | None = None,
 ) -> None:
     message = callback.message
     if not isinstance(message, Message) or message.chat.type != ChatType.PRIVATE:
         await callback.answer("Открыть тикет можно только в личном чате с ботом.", show_alert=True)
         return
 
-    user = await get_or_create_user(session, callback.from_user)
+    user = await get_or_create_user(session, callback.from_user, known_user)
     if user.blocked:
         await message.answer(BLOCKED_TEXT, reply_markup=ReplyKeyboardRemove())
         await callback.answer()
@@ -151,13 +152,14 @@ async def choose_form(
     settings: Settings,
     state: FSMContext,
     ticket_form_service: TicketFormService,
+    known_user: User | None = None,
 ) -> None:
     message = callback.message
     if not isinstance(message, Message) or message.chat.type != ChatType.PRIVATE:
         await callback.answer("Выбрать форму можно только в личном чате с ботом.", show_alert=True)
         return
 
-    user = await get_or_create_user(session, callback.from_user)
+    user = await get_or_create_user(session, callback.from_user, known_user)
     if user.blocked:
         await message.answer(BLOCKED_TEXT, reply_markup=ReplyKeyboardRemove())
         await callback.answer()
@@ -412,6 +414,7 @@ async def cancel_ticket_fill(
     settings: Settings,
     state: FSMContext,
     ticket_form_service: TicketFormService,
+    known_user: User | None = None,
 ) -> None:
     message = callback.message
     if not isinstance(message, Message) or message.chat.type != ChatType.PRIVATE:
@@ -420,7 +423,7 @@ async def cancel_ticket_fill(
 
     data = await state.get_data()
     form = get_state_form(ticket_form_service, data)
-    user = await get_or_create_user(session, callback.from_user)
+    user = await get_or_create_user(session, callback.from_user, known_user)
     ticket_service = TicketService(session, settings.support_chat_id)
     open_ticket = await ticket_service.get_open_ticket_by_user_id(user.id)
     if open_ticket and form is None:
@@ -451,13 +454,14 @@ async def submit_ticket(
     settings: Settings,
     state: FSMContext,
     ticket_form_service: TicketFormService,
+    known_user: User | None = None,
 ) -> None:
     message = callback.message
     if not isinstance(message, Message) or message.chat.type != ChatType.PRIVATE:
         await callback.answer("Отправить тикет можно только в личном чате с ботом.", show_alert=True)
         return
 
-    user = await get_or_create_user(session, callback.from_user)
+    user = await get_or_create_user(session, callback.from_user, known_user)
     if user.blocked:
         await message.answer(BLOCKED_TEXT, reply_markup=ReplyKeyboardRemove())
         await callback.answer()
@@ -1214,9 +1218,9 @@ async def get_or_create_user(
     telegram_user: Any,
     known_user: User | None = None,
 ) -> User:
-    if known_user is None:
-        user, _ = await UserService(session).get_or_create_from_telegram(telegram_user)
-        return user
+    if known_user is not None:
+        return known_user
+
     user, _ = await UserService(session).get_or_create_from_telegram(telegram_user)
     return user
 

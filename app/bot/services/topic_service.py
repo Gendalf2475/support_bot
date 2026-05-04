@@ -26,6 +26,29 @@ class TopicService:
             return user.topic_id, False
         return await self.create_topic(bot, user)
 
+    async def sync_topic_title(self, bot: Bot, user: User) -> None:
+        if not user.topic_id:
+            return
+
+        title = self.build_topic_title(user)
+        try:
+            await bot.edit_forum_topic(
+                chat_id=self.support_chat_id,
+                message_thread_id=user.topic_id,
+                name=title,
+            )
+        except TelegramAPIError as error:
+            logger.error(
+                "Failed to rename topic topic_id=%s telegram_id=%s title=%s: %s",
+                user.topic_id,
+                user.telegram_id,
+                title,
+                error,
+            )
+            return
+
+        logger.info("Renamed topic topic_id=%s telegram_id=%s title=%s", user.topic_id, user.telegram_id, title)
+
     async def recreate_topic(self, bot: Bot, user: User) -> tuple[int, bool]:
         logger.warning(
             "Topic for user telegram_id=%s is unavailable. Creating a new topic.",

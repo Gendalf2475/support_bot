@@ -395,7 +395,7 @@ class TicketService:
 
     @staticmethod
     def build_admin_ticket_text(form: TicketForm, user: User, answers: list[dict[str, Any]]) -> str:
-        username = f"@{user.username}" if user.username else "нет username"
+        username = f"@{str(user.username).strip('@')}" if user.username else "нет username"
         full_name = user.full_name or "не указано"
         lines = [
             "🟣 Новый тикет",

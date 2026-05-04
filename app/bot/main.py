@@ -45,6 +45,7 @@ async def main() -> None:
     dispatcher.edited_message.outer_middleware(db_middleware)
     dispatcher.edited_message.outer_middleware(block_check_middleware)
     dispatcher.callback_query.outer_middleware(db_middleware)
+    dispatcher.callback_query.outer_middleware(block_check_middleware)
 
     dispatcher.include_router(admin.router)
     dispatcher.include_router(user_messages.router)

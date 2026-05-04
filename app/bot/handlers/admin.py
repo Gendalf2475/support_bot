@@ -406,7 +406,7 @@ async def send_to_topic(bot: Bot, support_chat_id: int, topic_id: int | None, te
 
 
 def format_username(user: User) -> str:
-    return f"@{user.username}" if user.username else "нет username"
+    return f"@{str(user.username).strip('@')}" if user.username else "нет username"
 
 
 def format_dt(value: datetime | None) -> str:
