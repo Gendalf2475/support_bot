@@ -8,6 +8,7 @@ from aiogram.types import Message
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.bot.channels.base import IncomingMessage
 from app.bot.database.models import MessageDirection, MessageMap, Ticket, User, utcnow
 
 
@@ -133,15 +134,21 @@ class MessageService:
     async def create_message_map(
         self,
         user: User,
-        user_message_id: int,
-        support_message_id: int,
+        user_message_id: int | None,
+        support_message_id: int | None,
         topic_id: int,
         direction: MessageDirection,
         ticket_id: int | None = None,
+        platform: str | None = None,
+        platform_message_id: str | None = None,
+        telegram_support_message_id: int | None = None,
     ) -> MessageMap:
         message_map = MessageMap(
             user_id=user.id,
             ticket_id=ticket_id,
+            platform=platform or user.platform,
+            platform_message_id=platform_message_id or (str(user_message_id) if user_message_id is not None else None),
+            telegram_support_message_id=telegram_support_message_id or support_message_id,
             user_message_id=user_message_id,
             support_message_id=support_message_id,
             topic_id=topic_id,
@@ -150,6 +157,52 @@ class MessageService:
         self.session.add(message_map)
         await self.session.flush()
         return message_map
+
+    async def send_external_message_to_support(
+        self,
+        bot: Bot,
+        incoming: IncomingMessage,
+        user: User,
+        ticket: Ticket | None = None,
+    ) -> int:
+        if not user.topic_id:
+            raise TopicUnavailableError("User has no topic_id")
+
+        text = incoming.text.strip() if incoming.text else ""
+        lines = [
+            f"Сообщение пользователя ({incoming.platform}):",
+            "",
+            text or "— без текста",
+        ]
+        if incoming.attachments:
+            lines.extend(["", "Вложения:"])
+            for index, attachment in enumerate(incoming.attachments, start=1):
+                value = attachment.file_url or attachment.filename or attachment.file_id or "без ссылки"
+                lines.append(f"{index}. {attachment.type}: {value}")
+
+        try:
+            sent = await bot.send_message(
+                chat_id=self.support_chat_id,
+                message_thread_id=user.topic_id,
+                text=self._limit_text("\n".join(lines)),
+            )
+        except TelegramBadRequest as error:
+            if self.is_topic_unavailable_error(error):
+                raise TopicUnavailableError(str(error)) from error
+            raise
+
+        await self.create_message_map(
+            user=user,
+            user_message_id=None,
+            support_message_id=sent.message_id,
+            topic_id=user.topic_id,
+            direction=MessageDirection.USER_TO_SUPPORT,
+            ticket_id=ticket.id if ticket else None,
+            platform=incoming.platform,
+            platform_message_id=incoming.raw_message_id,
+            telegram_support_message_id=sent.message_id,
+        )
+        return sent.message_id
 
     async def copy_ticket_form_media_to_support(
         self,

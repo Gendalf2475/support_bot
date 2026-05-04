@@ -6,7 +6,7 @@ from datetime import datetime
 from html import escape
 from typing import Any
 
-from app.bot.database.models import Ticket, TicketAnswer, TicketAnswerMedia, TicketStatus, User
+from app.bot.database.models import Platform, Ticket, TicketAnswer, TicketAnswerMedia, TicketStatus, User
 from app.bot.services.ticket_form_service import TicketForm, TicketQuestion
 
 
@@ -194,18 +194,23 @@ class TicketFormatter:
 
     @classmethod
     def _build_header(cls, ticket_id: int, form_title: str, user: User) -> str:
-        username = f"@{str(user.username).strip('@')}" if user.username else "нет username"
+        platform_name = cls._platform_name(user.platform)
+        username = cls._format_username(user)
+        platform_user_id = user.platform_user_id or (str(user.telegram_id) if user.telegram_id else "не указан")
         full_name = user.full_name or "не указано"
         return "\n".join(
             [
                 f"🟣 Новый тикет #{ticket_id}",
                 "",
+                "Платформа:",
+                platform_name,
+                "",
                 "Тип обращения:",
                 cls._e(form_title),
                 "",
                 "Пользователь:",
-                f"• Telegram: {cls._e(username)}",
-                f"• ID: {user.telegram_id}",
+                f"• Username: {cls._e(username)}",
+                f"• Platform ID: {cls._e(platform_user_id)}",
                 f"• Имя: {cls._e(full_name)}",
             ]
         )
@@ -407,6 +412,24 @@ class TicketFormatter:
     @staticmethod
     def _e(value: str) -> str:
         return escape(str(value), quote=False)
+
+    @staticmethod
+    def _platform_name(platform: str | None) -> str:
+        names = {
+            Platform.TELEGRAM.value: "Telegram",
+            Platform.DISCORD.value: "Discord",
+            Platform.VK.value: "VK",
+        }
+        return names.get(str(platform or Platform.TELEGRAM.value), str(platform or "Telegram"))
+
+    @staticmethod
+    def _format_username(user: User) -> str:
+        if not user.username:
+            return "нет username"
+        username = str(user.username).strip()
+        if user.platform == Platform.TELEGRAM.value:
+            return f"@{username.strip('@')}"
+        return username
 
     @staticmethod
     def _limit_caption(caption: str) -> str:

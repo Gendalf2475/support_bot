@@ -13,7 +13,8 @@ from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.bot.database.models import Ticket, TicketAnswer, TicketAnswerMedia, TicketStatus, User, utcnow
+from app.bot.database.models import Platform, Ticket, TicketAnswer, TicketAnswerMedia, TicketStatus, User, utcnow
+from app.bot.services.platform_router import PlatformRouter
 from app.bot.services.ticket_formatter import TicketFormatter
 from app.bot.services.ticket_form_service import TicketForm
 
@@ -87,6 +88,7 @@ class TicketService:
         now = utcnow()
         ticket = Ticket(
             user_id=user.id,
+            platform=user.platform,
             form_id=form.id,
             form_title=form.admin_title,
             status=TicketStatus.OPEN,
@@ -99,7 +101,13 @@ class TicketService:
         await self.session.flush()
         self._add_answers(ticket, form, answers)
         await self.session.flush()
-        logger.info("Created open ticket id=%s telegram_id=%s topic_id=%s", ticket.id, user.telegram_id, topic_id)
+        logger.info(
+            "Created open ticket id=%s platform=%s platform_user_id=%s topic_id=%s",
+            ticket.id,
+            user.platform,
+            user.platform_user_id,
+            topic_id,
+        )
         return ticket
 
     async def create_cancelled_ticket(
@@ -110,6 +118,7 @@ class TicketService:
     ) -> Ticket:
         ticket = Ticket(
             user_id=user.id,
+            platform=user.platform,
             form_id=form.id,
             form_title=form.admin_title,
             status=TicketStatus.CANCELLED,
@@ -119,7 +128,7 @@ class TicketService:
         await self.session.flush()
         self._add_answers(ticket, form, answers)
         await self.session.flush()
-        logger.info("Created cancelled ticket id=%s telegram_id=%s", ticket.id, user.telegram_id)
+        logger.info("Created cancelled ticket id=%s platform=%s platform_user_id=%s", ticket.id, user.platform, user.platform_user_id)
         return ticket
 
     async def set_topic_id(self, ticket: Ticket, topic_id: int) -> None:
@@ -165,6 +174,7 @@ class TicketService:
         closed_by_telegram_id: int | None = None,
         auto_close_after_days: int | None = None,
         ticket_forms: list[TicketForm] | None = None,
+        platform_router: PlatformRouter | None = None,
     ) -> bool:
         if ticket.status != TicketStatus.OPEN:
             return False
@@ -193,22 +203,34 @@ class TicketService:
                 logger.error("Failed to send ticket closed notice ticket_id=%s topic_id=%s: %s", ticket.id, topic_id, error)
 
         if user:
-            try:
-                reply_markup = None
-                if not user.blocked and ticket_forms:
-                    from app.bot.keyboards import ticket_forms_reply_keyboard
-
-                    reply_markup = ticket_forms_reply_keyboard(ticket_forms)
-
-                await bot.send_message(
-                    chat_id=user.telegram_id,
+            notification_sent = False
+            if platform_router is not None:
+                sent = await platform_router.send_ticket_closed(
+                    user=user,
                     text=self.build_user_close_text(reason, auto_close_after_days),
-                    reply_markup=reply_markup,
+                    telegram_bot=bot,
+                    ticket_forms=ticket_forms,
                 )
-            except TelegramAPIError as error:
-                logger.error("Failed to notify user about closed ticket ticket_id=%s telegram_id=%s: %s", ticket.id, user.telegram_id, error)
-                if topic_id:
-                    await self.notify_support_about_user_notification_error(bot, topic_id)
+                notification_sent = sent is not None or user.blocked
+            elif user.platform == Platform.TELEGRAM.value and user.telegram_id is not None:
+                try:
+                    reply_markup = None
+                    if not user.blocked and ticket_forms:
+                        from app.bot.keyboards import ticket_forms_reply_keyboard
+
+                        reply_markup = ticket_forms_reply_keyboard(ticket_forms)
+
+                    await bot.send_message(
+                        chat_id=user.telegram_id,
+                        text=self.build_user_close_text(reason, auto_close_after_days),
+                        reply_markup=reply_markup,
+                    )
+                    notification_sent = True
+                except TelegramAPIError as error:
+                    logger.error("Failed to notify user about closed ticket ticket_id=%s telegram_id=%s: %s", ticket.id, user.telegram_id, error)
+
+            if not notification_sent and topic_id:
+                await self.notify_support_about_user_notification_error(bot, topic_id)
 
         if user:
             await self.update_ticket_card(bot, ticket, user)
@@ -267,6 +289,7 @@ class TicketService:
         bot: Bot,
         auto_close_after_days: int,
         ticket_forms: list[TicketForm] | None = None,
+        platform_router: PlatformRouter | None = None,
     ) -> int:
         now = utcnow()
         inactive_before = now - timedelta(days=auto_close_after_days)
@@ -295,6 +318,7 @@ class TicketService:
                     closed_by_telegram_id=None,
                     auto_close_after_days=auto_close_after_days,
                     ticket_forms=ticket_forms,
+                    platform_router=platform_router,
                 )
             except Exception as error:
                 logger.exception("Failed to auto-close ticket_id=%s: %s", ticket.id, error)
@@ -332,6 +356,9 @@ class TicketService:
                             file_id=str(media.get("file_id") or ""),
                             media_type=str(media.get("media_type") or "media"),
                             caption=media.get("caption"),
+                            file_url=media.get("file_url"),
+                            filename=media.get("filename"),
+                            mime_type=media.get("mime_type"),
                             media_group_id=media.get("media_group_id"),
                             sort_order=TicketService._media_sort_order(media, media_index),
                         )
@@ -395,14 +422,18 @@ class TicketService:
 
     @staticmethod
     def build_admin_ticket_text(form: TicketForm, user: User, answers: list[dict[str, Any]]) -> str:
-        username = f"@{str(user.username).strip('@')}" if user.username else "нет username"
+        if user.username and user.platform == Platform.TELEGRAM.value:
+            username = f"@{str(user.username).strip('@')}"
+        else:
+            username = str(user.username).strip() if user.username else "нет username"
         full_name = user.full_name or "не указано"
         lines = [
             "🟣 Новый тикет",
             "",
+            f"Платформа: {user.platform}",
             f"Тип: {form.admin_title}",
-            f"Пользователь: {username}",
-            f"ID: {user.telegram_id}",
+            f"Username: {username}",
+            f"Platform ID: {user.platform_user_id}",
             f"Имя: {full_name}",
             "",
             "Данные формы:",
@@ -460,6 +491,9 @@ class TicketService:
                     "file_id": answer.get("file_id"),
                     "media_type": answer.get("media_type"),
                     "caption": answer.get("caption"),
+                    "file_url": answer.get("file_url"),
+                    "filename": answer.get("filename"),
+                    "mime_type": answer.get("mime_type"),
                     "source_message_id": answer.get("source_message_id"),
                     "media_group_id": answer.get("media_group_id"),
                     "sort_order": answer.get("sort_order", answer.get("source_message_id", 0)),

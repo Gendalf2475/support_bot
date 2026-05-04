@@ -9,6 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.bot.config import Settings
 from app.bot.keyboards import SUPPORT_CLOSE_TICKET_TEXT
 from app.bot.services.message_service import MessageService
+from app.bot.database.models import Platform
+from app.bot.services.platform_router import PlatformRouter
 from app.bot.services.ticket_service import CLOSE_REASONS, MANUAL_CLOSE_REASON_CODES, TicketService
 from app.bot.services.user_service import UserService
 
@@ -23,6 +25,7 @@ async def handle_support_message(
     bot: Bot,
     session: AsyncSession,
     settings: Settings,
+    platform_router: PlatformRouter | None = None,
 ) -> None:
     if not is_support_topic_message(message, settings.support_chat_id):
         return
@@ -41,7 +44,16 @@ async def handle_support_message(
         return
 
     message_service = MessageService(session, settings.support_chat_id)
-    await message_service.copy_support_message_to_user(bot, message, user, ticket)
+    if user.platform == Platform.TELEGRAM.value:
+        await message_service.copy_support_message_to_user(bot, message, user, ticket)
+        return
+
+    if platform_router is None:
+        logger.error("No platform router for support reply platform=%s user_id=%s", user.platform, user.id)
+        await message.answer("Не настроен адаптер платформы пользователя.")
+        return
+
+    await platform_router.send_support_message(session, bot, message, user, ticket)
 
 
 @router.edited_message()
@@ -50,6 +62,7 @@ async def handle_support_edited_message(
     bot: Bot,
     session: AsyncSession,
     settings: Settings,
+    platform_router: PlatformRouter | None = None,
 ) -> None:
     if not is_support_topic_message(message, settings.support_chat_id):
         return
@@ -61,6 +74,13 @@ async def handle_support_edited_message(
     user = await user_service.get_by_topic_id(topic_id)
     if user is None:
         logger.info("Ignored edited support message from unknown topic_id=%s", topic_id)
+        return
+
+    if user.platform != Platform.TELEGRAM.value:
+        if platform_router is not None:
+            text = MessageService.extract_text_or_caption(message)
+            if text:
+                await platform_router.send_text(user, f"✏️ Сообщение поддержки было изменено:\n\n{text}", telegram_bot=bot)
         return
 
     message_service = MessageService(session, settings.support_chat_id)

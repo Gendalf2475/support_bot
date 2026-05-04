@@ -22,6 +22,7 @@ from app.bot.keyboards import (
 )
 from app.bot.services.ticket_form_service import TicketFormService
 from app.bot.services.ticket_service import CLOSE_REASONS, MANUAL_CLOSE_REASON_CODES, TicketService
+from app.bot.services.platform_router import PlatformRouter
 from app.bot.services.user_service import UserService
 
 
@@ -30,13 +31,19 @@ router = Router(name="admin")
 
 
 @router.message(Command("block"))
-async def block_user(message: Message, bot: Bot, session: AsyncSession, settings: Settings) -> None:
+async def block_user(
+    message: Message,
+    bot: Bot,
+    session: AsyncSession,
+    settings: Settings,
+    platform_router: PlatformRouter | None = None,
+) -> None:
     user = await get_command_user(message, session, settings)
     if user is None:
         return
 
     await UserService(session).set_blocked(user, True)
-    logger.info("Blocked user telegram_id=%s topic_id=%s", user.telegram_id, user.topic_id)
+    logger.info("Blocked user platform=%s platform_user_id=%s topic_id=%s", user.platform, user.platform_user_id, user.topic_id)
     await send_to_topic(bot, settings.support_chat_id, user.topic_id, "Пользователь заблокирован.")
     await notify_user(
         bot,
@@ -44,17 +51,24 @@ async def block_user(message: Message, bot: Bot, session: AsyncSession, settings
         user,
         "Вы были заблокированы службой поддержки.",
         "Пользователь заблокирован, но уведомление в ЛС отправить не удалось.",
+        platform_router=platform_router,
     )
 
 
 @router.message(Command("unblock"))
-async def unblock_user(message: Message, bot: Bot, session: AsyncSession, settings: Settings) -> None:
+async def unblock_user(
+    message: Message,
+    bot: Bot,
+    session: AsyncSession,
+    settings: Settings,
+    platform_router: PlatformRouter | None = None,
+) -> None:
     user = await get_command_user(message, session, settings)
     if user is None:
         return
 
     await UserService(session).set_blocked(user, False)
-    logger.info("Unblocked user telegram_id=%s topic_id=%s", user.telegram_id, user.topic_id)
+    logger.info("Unblocked user platform=%s platform_user_id=%s topic_id=%s", user.platform, user.platform_user_id, user.topic_id)
     await send_to_topic(bot, settings.support_chat_id, user.topic_id, "Пользователь разблокирован.")
     await notify_user(
         bot,
@@ -62,6 +76,7 @@ async def unblock_user(message: Message, bot: Bot, session: AsyncSession, settin
         user,
         "Вы были разблокированы службой поддержки. Теперь вы снова можете писать сюда.",
         "Пользователь разблокирован, но уведомление в ЛС отправить не удалось.",
+        platform_router=platform_router,
     )
 
 
@@ -73,16 +88,16 @@ async def user_status(message: Message, bot: Bot, session: AsyncSession, setting
 
     open_ticket = await TicketService(session, settings.support_chat_id).get_open_ticket_by_user_id(user.id)
     text = (
-        "Статус пользователя\n\n"
+        "🟣 Статус пользователя\n\n"
         f"user_id: {user.id}\n"
-        f"telegram_id: {user.telegram_id}\n"
-        f"username: {format_username(user)}\n"
-        f"full_name: {user.full_name or 'не указано'}\n"
-        f"blocked: {user.blocked}\n"
-        f"topic_id: {user.topic_id}\n"
-        f"open_ticket: {'да' if open_ticket else 'нет'}\n"
-        f"open_ticket_id: {open_ticket.id if open_ticket else 'нет'}\n"
-        f"ticket_status: {open_ticket.status.value if open_ticket else 'нет'}\n"
+        f"Платформа: {format_platform(user)}\n"
+        f"Platform ID: {user.platform_user_id}\n"
+        f"Username: {format_username(user)}\n"
+        f"Имя: {user.full_name or 'не указано'}\n"
+        f"Topic ID: {user.topic_id}\n"
+        f"Blocked: {user.blocked}\n"
+        f"Открытый тикет: #{open_ticket.id if open_ticket else 'нет'}\n"
+        f"Статус тикета: {open_ticket.status.value if open_ticket else 'нет'}\n"
         f"ticket_created_at: {format_dt(open_ticket.created_at) if open_ticket else 'нет'}\n"
         f"created_at: {format_dt(user.created_at)}\n"
         f"updated_at: {format_dt(user.updated_at)}"
@@ -142,6 +157,7 @@ async def close_ticket_by_reason_keyboard(
     session: AsyncSession,
     settings: Settings,
     ticket_form_service: TicketFormService,
+    platform_router: PlatformRouter | None = None,
 ) -> None:
     if message.chat.id != settings.support_chat_id:
         return
@@ -172,6 +188,7 @@ async def close_ticket_by_reason_keyboard(
         closed_by_telegram_id=message.from_user.id,
         reason=reason,
         ticket_form_service=ticket_form_service,
+        platform_router=platform_router,
     )
     if not closed:
         await message.answer("Тикет уже закрыт.")
@@ -236,6 +253,7 @@ async def close_ticket_with_reason(
     session: AsyncSession,
     settings: Settings,
     ticket_form_service: TicketFormService,
+    platform_router: PlatformRouter | None = None,
 ) -> None:
     message = callback.message
     if not isinstance(message, Message):
@@ -265,7 +283,7 @@ async def close_ticket_with_reason(
         return
 
     assert ticket is not None
-    closed = await close_ticket(bot, ticket_service, ticket, callback.from_user.id, reason, ticket_form_service)
+    closed = await close_ticket(bot, ticket_service, ticket, callback.from_user.id, reason, ticket_form_service, platform_router)
     if not closed:
         await callback.answer("Тикет уже закрыт.", show_alert=True)
         return
@@ -309,6 +327,7 @@ async def close_ticket(
     closed_by_telegram_id: int,
     reason: str,
     ticket_form_service: TicketFormService,
+    platform_router: PlatformRouter | None = None,
 ) -> bool:
     return await ticket_service.close_ticket(
         bot=bot,
@@ -316,6 +335,7 @@ async def close_ticket(
         reason=reason,
         closed_by_telegram_id=closed_by_telegram_id,
         ticket_forms=ticket_form_service.get_forms() if ticket_form_service.enabled else None,
+        platform_router=platform_router,
     )
 
 
@@ -391,7 +411,17 @@ async def notify_user(
     user: User,
     text: str,
     error_text: str,
+    platform_router: PlatformRouter | None = None,
 ) -> None:
+    if platform_router is not None:
+        sent = await platform_router.send_text(user, text, telegram_bot=bot)
+        if sent is not None:
+            return
+
+    if user.telegram_id is None:
+        await send_to_topic(bot, support_chat_id, user.topic_id, error_text)
+        return
+
     try:
         await bot.send_message(chat_id=user.telegram_id, text=text)
     except TelegramAPIError as error:
@@ -406,7 +436,16 @@ async def send_to_topic(bot: Bot, support_chat_id: int, topic_id: int | None, te
 
 
 def format_username(user: User) -> str:
-    return f"@{str(user.username).strip('@')}" if user.username else "нет username"
+    if not user.username:
+        return "нет username"
+    if user.platform == "telegram":
+        return f"@{str(user.username).strip('@')}"
+    return str(user.username).strip()
+
+
+def format_platform(user: User) -> str:
+    names = {"telegram": "Telegram", "discord": "Discord", "vk": "VK"}
+    return names.get(user.platform, user.platform)
 
 
 def format_dt(value: datetime | None) -> str:

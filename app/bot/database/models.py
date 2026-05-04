@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from enum import StrEnum
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Enum, ForeignKey, Integer, String, Text
+from sqlalchemy import BigInteger, Boolean, DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -21,6 +21,12 @@ class MessageDirection(StrEnum):
     TICKET_FORM_MEDIA = "ticket_form_media"
 
 
+class Platform(StrEnum):
+    TELEGRAM = "telegram"
+    DISCORD = "discord"
+    VK = "vk"
+
+
 class TicketStatus(StrEnum):
     OPEN = "open"
     CLOSED = "closed"
@@ -29,9 +35,12 @@ class TicketStatus(StrEnum):
 
 class User(Base):
     __tablename__ = "users"
+    __table_args__ = (UniqueConstraint("platform", "platform_user_id", name="uq_users_platform_user_id"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True, nullable=False)
+    telegram_id: Mapped[int | None] = mapped_column(BigInteger, unique=True, index=True, nullable=True)
+    platform: Mapped[str] = mapped_column(String(32), index=True, nullable=False, default=Platform.TELEGRAM.value)
+    platform_user_id: Mapped[str] = mapped_column(String(255), index=True, nullable=False)
     username: Mapped[str | None] = mapped_column(String(255), nullable=True)
     full_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     topic_id: Mapped[int | None] = mapped_column(Integer, unique=True, index=True, nullable=True)
@@ -59,6 +68,7 @@ class Ticket(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
+    platform: Mapped[str] = mapped_column(String(32), index=True, nullable=False, default=Platform.TELEGRAM.value)
     form_id: Mapped[str] = mapped_column(String(128), nullable=False)
     form_title: Mapped[str] = mapped_column(String(255), nullable=False)
     status: Mapped[TicketStatus] = mapped_column(
@@ -132,6 +142,9 @@ class TicketAnswerMedia(Base):
     file_id: Mapped[str] = mapped_column(String(512), nullable=False)
     media_type: Mapped[str] = mapped_column(String(32), nullable=False)
     caption: Mapped[str | None] = mapped_column(Text, nullable=True)
+    file_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    mime_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
     media_group_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
@@ -149,8 +162,11 @@ class MessageMap(Base):
         index=True,
         nullable=True,
     )
-    user_message_id: Mapped[int] = mapped_column(Integer, index=True, nullable=False)
-    support_message_id: Mapped[int] = mapped_column(Integer, index=True, nullable=False)
+    platform: Mapped[str] = mapped_column(String(32), index=True, nullable=False, default=Platform.TELEGRAM.value)
+    platform_message_id: Mapped[str | None] = mapped_column(String(255), index=True, nullable=True)
+    telegram_support_message_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True)
+    user_message_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True)
+    support_message_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True)
     topic_id: Mapped[int] = mapped_column(Integer, index=True, nullable=False)
     direction: Mapped[MessageDirection] = mapped_column(
         Enum(

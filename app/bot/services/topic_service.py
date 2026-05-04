@@ -5,7 +5,7 @@ import logging
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 
-from app.bot.database.models import User
+from app.bot.database.models import Platform, User
 from app.bot.services.user_service import UserService
 
 
@@ -39,20 +39,22 @@ class TopicService:
             )
         except TelegramAPIError as error:
             logger.error(
-                "Failed to rename topic topic_id=%s telegram_id=%s title=%s: %s",
+                "Failed to rename topic topic_id=%s platform=%s platform_user_id=%s title=%s: %s",
                 user.topic_id,
-                user.telegram_id,
+                user.platform,
+                user.platform_user_id,
                 title,
                 error,
             )
             return
 
-        logger.info("Renamed topic topic_id=%s telegram_id=%s title=%s", user.topic_id, user.telegram_id, title)
+        logger.info("Renamed topic topic_id=%s platform=%s platform_user_id=%s title=%s", user.topic_id, user.platform, user.platform_user_id, title)
 
     async def recreate_topic(self, bot: Bot, user: User) -> tuple[int, bool]:
         logger.warning(
-            "Topic for user telegram_id=%s is unavailable. Creating a new topic.",
-            user.telegram_id,
+            "Topic for user platform=%s platform_user_id=%s is unavailable. Creating a new topic.",
+            user.platform,
+            user.platform_user_id,
         )
         return await self.create_topic(bot, user)
 
@@ -63,8 +65,9 @@ class TopicService:
             topic = await bot.create_forum_topic(chat_id=self.support_chat_id, name=title)
         except TelegramAPIError as error:
             logger.error(
-                "Failed to create topic for telegram_id=%s in support_chat_id=%s: %s",
-                user.telegram_id,
+                "Failed to create topic for platform=%s platform_user_id=%s in support_chat_id=%s: %s",
+                user.platform,
+                user.platform_user_id,
                 self.support_chat_id,
                 error,
             )
@@ -75,22 +78,37 @@ class TopicService:
 
         await self.user_service.set_topic_id(user, topic.message_thread_id)
         logger.info(
-            "Created topic topic_id=%s for telegram_id=%s",
+            "Created topic topic_id=%s for platform=%s platform_user_id=%s",
             topic.message_thread_id,
-            user.telegram_id,
+            user.platform,
+            user.platform_user_id,
         )
 
         return topic.message_thread_id, True
 
     @staticmethod
     def build_topic_title(user: User) -> str:
+        prefix = TopicService.platform_prefix(user.platform)
         if user.username:
-            title = f"@{user.username.strip('@')}"
+            username = user.username.strip("@")
+            if user.platform == Platform.TELEGRAM.value:
+                title = f"{prefix} | @{username}"
+            else:
+                title = f"{prefix} | {username}"
         else:
             fallback_name = (user.full_name or "Имя пользователя").strip()
-            title = f"{fallback_name} | ID {user.telegram_id}"
+            title = f"{prefix} | {fallback_name} | ID {user.platform_user_id or user.telegram_id}"
 
         title = " ".join(title.split())
         if not title:
-            title = f"User ID {user.telegram_id}"
+            title = f"{prefix} | ID {user.platform_user_id or user.telegram_id}"
         return title[:128]
+
+    @staticmethod
+    def platform_prefix(platform: str | None) -> str:
+        prefixes = {
+            Platform.TELEGRAM.value: "TG",
+            Platform.DISCORD.value: "DS",
+            Platform.VK.value: "VK",
+        }
+        return prefixes.get(str(platform or Platform.TELEGRAM.value), str(platform or "USER").upper()[:8])

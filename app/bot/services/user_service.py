@@ -4,10 +4,10 @@ import logging
 from dataclasses import dataclass
 
 from aiogram.types import User as TelegramUser
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.bot.database.models import User, utcnow
+from app.bot.database.models import Platform, User, utcnow
 
 
 logger = logging.getLogger(__name__)
@@ -22,6 +22,8 @@ class UserUpsertResult:
     new_username: str | None
     old_full_name: str | None
     new_full_name: str
+    old_platform_user_id: str | None = None
+    new_platform_user_id: str | None = None
 
 
 class UserService:
@@ -33,47 +35,86 @@ class UserService:
         return result.user, result.created
 
     async def upsert_user_from_telegram(self, telegram_user: TelegramUser) -> UserUpsertResult:
-        user = await self.get_by_telegram_id(telegram_user.id)
-        full_name = self.normalize_full_name(telegram_user)
-        username = self.normalize_username(telegram_user.username)
-        now = utcnow()
+        result = await self.upsert_user(
+            platform=Platform.TELEGRAM.value,
+            platform_user_id=str(telegram_user.id),
+            username=telegram_user.username,
+            full_name=self.normalize_full_name(telegram_user),
+            telegram_id=telegram_user.id,
+        )
+        return result
 
+    async def upsert_user(
+        self,
+        platform: str,
+        platform_user_id: str,
+        username: str | None = None,
+        full_name: str | None = None,
+        telegram_id: int | None = None,
+    ) -> UserUpsertResult:
+        normalized_platform = self.normalize_platform(platform)
+        normalized_platform_user_id = str(platform_user_id).strip()
+        if not normalized_platform_user_id:
+            raise ValueError("platform_user_id must not be empty")
+
+        user = await self.get_by_platform_user_id(normalized_platform, normalized_platform_user_id)
+        if user is None and normalized_platform == Platform.TELEGRAM.value and telegram_id is not None:
+            user = await self.get_by_telegram_id(telegram_id)
+
+        normalized_username = self.normalize_username(username)
+        normalized_full_name = self.normalize_generic_full_name(full_name, normalized_platform_user_id)
+        now = utcnow()
         if user is None:
             user = User(
-                telegram_id=telegram_user.id,
-                username=username,
-                full_name=full_name,
+                telegram_id=telegram_id if normalized_platform == Platform.TELEGRAM.value else None,
+                platform=normalized_platform,
+                platform_user_id=normalized_platform_user_id,
+                username=normalized_username,
+                full_name=normalized_full_name,
                 updated_at=now,
             )
             self.session.add(user)
             await self.session.flush()
-            logger.info("Created new user telegram_id=%s", telegram_user.id)
+            logger.info("Created new user platform=%s platform_user_id=%s", normalized_platform, normalized_platform_user_id)
             return UserUpsertResult(
                 user=user,
                 created=True,
                 changed=True,
                 old_username=None,
-                new_username=username,
+                new_username=normalized_username,
                 old_full_name=None,
-                new_full_name=full_name,
+                new_full_name=normalized_full_name,
+                old_platform_user_id=None,
+                new_platform_user_id=normalized_platform_user_id,
             )
 
         old_username = user.username
         old_full_name = user.full_name
-        changed = old_username != username or old_full_name != full_name
-        user.username = username
-        user.full_name = full_name
+        old_platform_user_id = user.platform_user_id
+        changed = (
+            old_username != normalized_username
+            or old_full_name != normalized_full_name
+            or user.platform != normalized_platform
+            or old_platform_user_id != normalized_platform_user_id
+        )
+        user.platform = normalized_platform
+        user.platform_user_id = normalized_platform_user_id
+        if normalized_platform == Platform.TELEGRAM.value:
+            user.telegram_id = telegram_id
+        user.username = normalized_username
+        user.full_name = normalized_full_name
         user.updated_at = now
         await self.session.flush()
 
         if changed:
             logger.info(
-                "Updated user profile telegram_id=%s username=%s->%s full_name=%s->%s",
-                telegram_user.id,
+                "Updated user profile platform=%s platform_user_id=%s username=%s->%s full_name=%s->%s",
+                normalized_platform,
+                normalized_platform_user_id,
                 old_username,
-                username,
+                normalized_username,
                 old_full_name,
-                full_name,
+                normalized_full_name,
             )
 
         return UserUpsertResult(
@@ -81,13 +122,27 @@ class UserService:
             created=False,
             changed=changed,
             old_username=old_username,
-            new_username=username,
+            new_username=normalized_username,
             old_full_name=old_full_name,
-            new_full_name=full_name,
+            new_full_name=normalized_full_name,
+            old_platform_user_id=old_platform_user_id,
+            new_platform_user_id=normalized_platform_user_id,
         )
 
     async def get_by_telegram_id(self, telegram_id: int) -> User | None:
-        statement = select(User).where(User.telegram_id == telegram_id)
+        statement = select(User).where(
+            or_(
+                User.telegram_id == telegram_id,
+                (User.platform == Platform.TELEGRAM.value) & (User.platform_user_id == str(telegram_id)),
+            )
+        )
+        return await self.session.scalar(statement)
+
+    async def get_by_platform_user_id(self, platform: str, platform_user_id: str) -> User | None:
+        statement = select(User).where(
+            User.platform == self.normalize_platform(platform),
+            User.platform_user_id == str(platform_user_id),
+        )
         return await self.session.scalar(statement)
 
     async def get_by_topic_id(self, topic_id: int) -> User | None:
@@ -113,3 +168,15 @@ class UserService:
     def normalize_full_name(telegram_user: TelegramUser) -> str:
         full_name = str(telegram_user.full_name or telegram_user.first_name or "").strip()
         return full_name or str(telegram_user.id)
+
+    @staticmethod
+    def normalize_generic_full_name(full_name: str | None, fallback_id: str) -> str:
+        normalized = str(full_name or "").strip()
+        return normalized or str(fallback_id)
+
+    @staticmethod
+    def normalize_platform(platform: str) -> str:
+        normalized = str(platform or "").strip().lower()
+        if normalized not in {Platform.TELEGRAM.value, Platform.DISCORD.value, Platform.VK.value}:
+            raise ValueError(f"Unsupported platform: {platform}")
+        return normalized
