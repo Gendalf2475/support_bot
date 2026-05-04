@@ -13,12 +13,6 @@ forms:
         required: true
         answer_type: "text"
 
-      - id: "server"
-        text: "На каком режиме вы играли?"
-        help_text: "Например: Polit, Survival или другой режим."
-        required: true
-        answer_type: "text"
-
       - id: "last_login"
         text: "Когда вы примерно последний раз заходили на сервер?"
         help_text: "Например: вчера вечером, неделю назад, 15 апреля."
@@ -31,7 +25,7 @@ forms:
         required: false
         answer_type: "media"
         allow_multiple: true
-        max_files: 5
+        max_files: 10
 
   - id: "player_report"
     title: "Жалоба на игрока"
@@ -71,6 +65,12 @@ forms:
     button_text: "💬 Другое"
     admin_title: "Другое обращение"
     questions:
+      - id: "your_nickname"
+        text: "Введите ваш игровой ник:"
+        help_text: "Укажите ник точно так же, как он отображается на сервере."
+        required: true
+        answer_type: "text"
+
       - id: "message"
         text: "Опишите вашу проблему:"
         help_text: "Постарайтесь описать ситуацию максимально подробно."
