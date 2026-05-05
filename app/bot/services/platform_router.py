@@ -28,12 +28,16 @@ class PlatformRouter:
     def __init__(self) -> None:
         self.adapters: dict[str, ChannelAdapter] = {}
         self._state_clearer: Callable[[str, str], None] | None = None
+        self._state_reader: Callable[[str, str], dict[str, Any] | None] | None = None
 
     def register(self, adapter: ChannelAdapter) -> None:
         self.adapters[adapter.platform] = adapter
 
     def register_state_clearer(self, clearer: Callable[[str, str], None]) -> None:
         self._state_clearer = clearer
+
+    def register_state_reader(self, reader: Callable[[str, str], dict[str, Any] | None]) -> None:
+        self._state_reader = reader
 
     def clear_user_state(self, platform: str, platform_user_id: str | None) -> None:
         if self._state_clearer is None or not platform_user_id:
@@ -42,6 +46,15 @@ class PlatformRouter:
             self._state_clearer(platform, str(platform_user_id))
         except Exception as error:
             logger.exception("Failed to clear platform state platform=%s platform_user_id=%s: %s", platform, platform_user_id, error)
+
+    def get_user_state(self, platform: str, platform_user_id: str | None) -> dict[str, Any] | None:
+        if self._state_reader is None or not platform_user_id:
+            return None
+        try:
+            return self._state_reader(platform, str(platform_user_id))
+        except Exception as error:
+            logger.exception("Failed to read platform state platform=%s platform_user_id=%s: %s", platform, platform_user_id, error)
+            return None
 
     async def send_text(
         self,

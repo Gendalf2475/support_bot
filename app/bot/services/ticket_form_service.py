@@ -275,6 +275,13 @@ class TicketFormService:
                     answer_type,
                 )
                 continue
+            if allow_multiple and answer_type not in {ANSWER_TYPE_MEDIA, ANSWER_TYPE_ANY}:
+                logger.warning(
+                    "Question '%s' in form '%s' has allow_multiple=true but answer_type='%s'; media collection controls will be disabled.",
+                    question_id,
+                    form_label,
+                    answer_type,
+                )
 
             questions.append(
                 TicketQuestion(

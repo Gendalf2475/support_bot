@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
+from typing import Any
 
-from aiogram import Bot, F, Router
+from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatMemberStatus, ChatType
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
@@ -13,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.bot.config import Settings
+from app.bot.constants.actions import ACTION_TICKET_CLOSED
 from app.bot.database.models import Ticket, TicketStatus, User, utcnow
 from app.bot.keyboards import (
     CALLBACK_CLOSE_PREFIX,
@@ -172,6 +174,7 @@ async def debug_user(message: Message, bot: Bot, session: AsyncSession, settings
 async def force_close_user(
     message: Message,
     bot: Bot,
+    dispatcher: Dispatcher,
     session: AsyncSession,
     settings: Settings,
     platform_router: PlatformRouter | None = None,
@@ -209,6 +212,11 @@ async def force_close_user(
         ticket.updated_at = now
     if platform_router is not None:
         platform_router.clear_user_state(user.platform, user.platform_user_id)
+    if user.platform == "telegram":
+        telegram_id = parse_int(user.platform_user_id)
+        if telegram_id is not None:
+            fsm_context = await dispatcher.fsm.get_context(bot=bot, chat_id=telegram_id, user_id=telegram_id)
+            await fsm_context.clear()
 
     await session.flush()
     await session.commit()
@@ -217,6 +225,62 @@ async def force_close_user(
         await ticket_service.update_ticket_card(bot, ticket, user, CLOSE_REASONS[FORCE_CLOSED_REASON].label)
         await ticket_service.update_ticket_control_message(bot, ticket)
     await message.answer(f"Активные тикеты пользователя закрыты: {len(tickets)}")
+
+
+@router.message(Command("debug_state"))
+async def debug_state(
+    message: Message,
+    bot: Bot,
+    dispatcher: Dispatcher,
+    session: AsyncSession,
+    settings: Settings,
+    platform_router: PlatformRouter | None = None,
+) -> None:
+    if message.chat.id != settings.support_chat_id:
+        return
+    parsed = parse_platform_user_command(message.text or "")
+    if parsed is None:
+        await message.answer("Использование: /debug_state <platform> <platform_user_id>")
+        return
+
+    platform, platform_user_id = parsed
+    user = await UserService(session).get_by_platform_user_id(platform, platform_user_id)
+    active_ticket = await TicketService(session, settings.support_chat_id).get_open_ticket_by_user_id(user.id) if user else None
+    state_info = await read_user_state(
+        bot=bot,
+        dispatcher=dispatcher,
+        platform_router=platform_router,
+        platform=platform,
+        platform_user_id=platform_user_id,
+    )
+    await message.answer(format_debug_state_text(platform, platform_user_id, state_info, active_ticket))
+
+
+@router.message(Command("reset_state"))
+async def reset_state(
+    message: Message,
+    bot: Bot,
+    dispatcher: Dispatcher,
+    settings: Settings,
+    platform_router: PlatformRouter | None = None,
+) -> None:
+    if message.chat.id != settings.support_chat_id:
+        return
+    parsed = parse_platform_user_command(message.text or "")
+    if parsed is None:
+        await message.answer("Использование: /reset_state <platform> <platform_user_id>")
+        return
+
+    platform, platform_user_id = parsed
+    if platform == "telegram":
+        telegram_id = parse_int(platform_user_id)
+        if telegram_id is not None:
+            fsm_context = await dispatcher.fsm.get_context(bot=bot, chat_id=telegram_id, user_id=telegram_id)
+            await fsm_context.clear()
+    elif platform_router is not None:
+        platform_router.clear_user_state(platform, platform_user_id)
+
+    await message.answer("Состояние пользователя сброшено.")
 
 
 @router.message(Command("close"))
@@ -449,7 +513,7 @@ async def close_ticket_with_reason(
     await callback.answer("Тикет закрыт.")
 
 
-@router.callback_query(F.data == "ticket_closed")
+@router.callback_query(F.data == ACTION_TICKET_CLOSED)
 async def closed_ticket_button(callback: CallbackQuery) -> None:
     await callback.answer("Тикет уже закрыт.", show_alert=True)
 
@@ -567,6 +631,108 @@ def parse_platform_user_command(text: str) -> tuple[str, str] | None:
     if platform not in {"telegram", "discord", "vk"} or not platform_user_id:
         return None
     return platform, platform_user_id
+
+
+def parse_int(value: str | None) -> int | None:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+async def read_user_state(
+    *,
+    bot: Bot,
+    dispatcher: Dispatcher,
+    platform_router: PlatformRouter | None,
+    platform: str,
+    platform_user_id: str,
+) -> dict[str, Any]:
+    if platform == "telegram":
+        telegram_id = parse_int(platform_user_id)
+        if telegram_id is None:
+            return {"state": "invalid_telegram_id"}
+        fsm_context = await dispatcher.fsm.get_context(bot=bot, chat_id=telegram_id, user_id=telegram_id)
+        current_state = await fsm_context.get_state()
+        data = await fsm_context.get_data()
+        answers = data.get("answers")
+        media_files = data.get("current_media_files")
+        return {
+            "state": current_state or "none",
+            "selected_form_id": data.get("form_id"),
+            "current_question_index": data.get("question_index"),
+            "current_question_id": data.get("current_question_id"),
+            "answers_count": len(answers) if isinstance(answers, list) else 0,
+            "media_count": len(media_files) if isinstance(media_files, list) else count_media_in_answers(data),
+            "pending_action": detect_telegram_pending_action(current_state, data),
+            "fsm_data_keys": ", ".join(sorted(data.keys())) or "нет",
+        }
+
+    if platform_router is None:
+        return {"state": "platform_router_unavailable"}
+    state_info = platform_router.get_user_state(platform, platform_user_id)
+    return state_info or {"state": "none"}
+
+
+def count_media_in_answers(data: dict[str, Any]) -> int:
+    answers = data.get("answers")
+    current_question_id = data.get("current_question_id")
+    if not isinstance(answers, list) or not current_question_id:
+        return 0
+    for answer in answers:
+        if isinstance(answer, dict) and answer.get("question_id") == current_question_id:
+            media_files = answer.get("media_files")
+            if isinstance(media_files, list):
+                return len(media_files)
+            return 1 if answer.get("file_id") else 0
+    return 0
+
+
+def detect_telegram_pending_action(current_state: str | None, data: dict[str, Any]) -> str | None:
+    if current_state and current_state.endswith(":profile_choice"):
+        return "nickname_choice"
+    if current_state and current_state.endswith(":profile_change_confirm"):
+        return "nickname_change_confirmation"
+    if current_state and current_state.endswith(":minecraft_lookup_confirm"):
+        return "minecraft_lookup_confirmation"
+    if current_state and current_state.endswith(":collecting_media"):
+        return "media_continue"
+    if current_state and current_state.endswith(":confirming"):
+        return "ticket_preview"
+    if data.get("pending_media_question_id"):
+        return "media_continue"
+    if data.get("pending_minecraft_answer"):
+        return "minecraft_lookup_confirmation"
+    return None
+
+
+def format_debug_state_text(
+    platform: str,
+    platform_user_id: str,
+    state_info: dict[str, Any],
+    active_ticket: Ticket | None,
+) -> str:
+    lines = [
+        "🧪 Debug state\n\n"
+        f"platform: {platform}\n"
+        f"platform_user_id: {platform_user_id}\n"
+        f"FSM/current state: {state_info.get('state', 'none')}\n"
+        f"selected_form_id: {state_info.get('selected_form_id', 'нет')}\n"
+        f"current_question_index: {state_info.get('current_question_index', 'нет')}\n"
+        f"current_question_id: {state_info.get('current_question_id', 'нет')}\n"
+        f"answers_count: {state_info.get('answers_count', 0)}\n"
+        f"media_count: {state_info.get('media_count', 0)}\n"
+        f"pending_action: {state_info.get('pending_action') or 'нет'}"
+    ]
+    if state_info.get("fsm_data_keys") is not None:
+        lines.append(f"fsm_data_keys: {state_info.get('fsm_data_keys')}")
+    if active_ticket:
+        lines.append(f"active_ticket: #{active_ticket.id} {active_ticket.status.value}")
+    else:
+        lines.append("active_ticket: нет")
+    return "\n".join(lines)
 
 
 def format_debug_user_text(user: User, tickets: list[Ticket]) -> str:

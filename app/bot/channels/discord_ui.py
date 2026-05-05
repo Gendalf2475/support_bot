@@ -7,6 +7,19 @@ from typing import Any
 
 import discord
 
+from app.bot.constants.actions import (
+    ACTION_CANCEL,
+    ACTION_MEDIA_CONTINUE,
+    ACTION_MINECRAFT_LOOKUP_CONTINUE,
+    ACTION_MINECRAFT_LOOKUP_OTHER,
+    ACTION_PROFILE_NICKNAME_CHANGE_CANCEL,
+    ACTION_PROFILE_NICKNAME_CHANGE_CONFIRM,
+    ACTION_PROFILE_NICKNAME_OTHER,
+    ACTION_PROFILE_NICKNAME_YES,
+    ACTION_RESTART,
+    ACTION_SKIP,
+    ACTION_SUBMIT,
+)
 from app.bot.services.ticket_form_service import (
     ANSWER_TYPE_MEDIA,
     PROFILE_FIELD_MINECRAFT_NICKNAME,
@@ -98,10 +111,10 @@ class QuestionActionView(discord.ui.View):
         return False
 
     async def _skip_callback(self, interaction: discord.Interaction) -> None:
-        await self.on_action(interaction, "skip", _parse_custom_index(interaction), None)
+        await self.on_action(interaction, ACTION_SKIP, _parse_custom_index(interaction), None)
 
     async def _cancel_callback(self, interaction: discord.Interaction) -> None:
-        await self.on_action(interaction, "cancel", _parse_custom_index(interaction), None)
+        await self.on_action(interaction, ACTION_CANCEL, _parse_custom_index(interaction), None)
 
 
 class MediaContinueView(discord.ui.View):
@@ -133,10 +146,10 @@ class MediaContinueView(discord.ui.View):
         return False
 
     async def _continue_callback(self, interaction: discord.Interaction) -> None:
-        await self.on_action(interaction, "continue", _parse_custom_index(interaction), None)
+        await self.on_action(interaction, ACTION_MEDIA_CONTINUE, _parse_custom_index(interaction), None)
 
     async def _cancel_callback(self, interaction: discord.Interaction) -> None:
-        await self.on_action(interaction, "cancel", _parse_custom_index(interaction), None)
+        await self.on_action(interaction, ACTION_CANCEL, _parse_custom_index(interaction), None)
 
 
 class MinecraftNicknameView(discord.ui.View):
@@ -168,10 +181,10 @@ class MinecraftNicknameView(discord.ui.View):
         return False
 
     async def _yes_callback(self, interaction: discord.Interaction) -> None:
-        await self.on_action(interaction, "profile_yes", _parse_custom_index(interaction), None)
+        await self.on_action(interaction, ACTION_PROFILE_NICKNAME_YES, _parse_custom_index(interaction), None)
 
     async def _other_callback(self, interaction: discord.Interaction) -> None:
-        await self.on_action(interaction, "profile_other", _parse_custom_index(interaction), None)
+        await self.on_action(interaction, ACTION_PROFILE_NICKNAME_OTHER, _parse_custom_index(interaction), None)
 
 
 class MinecraftNicknameChangeConfirmView(discord.ui.View):
@@ -203,10 +216,10 @@ class MinecraftNicknameChangeConfirmView(discord.ui.View):
         return False
 
     async def _confirm_callback(self, interaction: discord.Interaction) -> None:
-        await self.on_action(interaction, "profile_change_confirm", _parse_custom_index(interaction), None)
+        await self.on_action(interaction, ACTION_PROFILE_NICKNAME_CHANGE_CONFIRM, _parse_custom_index(interaction), None)
 
     async def _cancel_callback(self, interaction: discord.Interaction) -> None:
-        await self.on_action(interaction, "profile_change_cancel", _parse_custom_index(interaction), None)
+        await self.on_action(interaction, ACTION_PROFILE_NICKNAME_CHANGE_CANCEL, _parse_custom_index(interaction), None)
 
 
 class MinecraftLookupConfirmView(discord.ui.View):
@@ -238,10 +251,10 @@ class MinecraftLookupConfirmView(discord.ui.View):
         return False
 
     async def _continue_callback(self, interaction: discord.Interaction) -> None:
-        await self.on_action(interaction, "minecraft_lookup_continue", _parse_custom_index(interaction), None)
+        await self.on_action(interaction, ACTION_MINECRAFT_LOOKUP_CONTINUE, _parse_custom_index(interaction), None)
 
     async def _other_callback(self, interaction: discord.Interaction) -> None:
-        await self.on_action(interaction, "minecraft_lookup_other", _parse_custom_index(interaction), None)
+        await self.on_action(interaction, ACTION_MINECRAFT_LOOKUP_OTHER, _parse_custom_index(interaction), None)
 
 
 class TicketPreviewView(discord.ui.View):
@@ -282,13 +295,13 @@ class TicketPreviewView(discord.ui.View):
         return False
 
     async def _submit_callback(self, interaction: discord.Interaction) -> None:
-        await self.on_action(interaction, "submit", None, self.form_id)
+        await self.on_action(interaction, ACTION_SUBMIT, None, self.form_id)
 
     async def _restart_callback(self, interaction: discord.Interaction) -> None:
-        await self.on_action(interaction, "restart", None, self.form_id)
+        await self.on_action(interaction, ACTION_RESTART, None, self.form_id)
 
     async def _cancel_callback(self, interaction: discord.Interaction) -> None:
-        await self.on_action(interaction, "cancel", None, self.form_id)
+        await self.on_action(interaction, ACTION_CANCEL, None, self.form_id)
 
 
 class ClosedTicketView(FormSelectView):

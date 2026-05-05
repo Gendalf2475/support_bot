@@ -11,6 +11,29 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.bot.channels.base import Attachment, IncomingMessage
 from app.bot.config import Settings
+from app.bot.constants.actions import (
+    ACTION_CANCEL,
+    ACTION_MEDIA_CONTINUE,
+    ACTION_MINECRAFT_LOOKUP_CONTINUE,
+    ACTION_MINECRAFT_LOOKUP_OTHER,
+    ACTION_PROFILE_NICKNAME_CHANGE_CANCEL,
+    ACTION_PROFILE_NICKNAME_CHANGE_CONFIRM,
+    ACTION_PROFILE_NICKNAME_OTHER,
+    ACTION_PROFILE_NICKNAME_YES,
+    ACTION_RESTART,
+    ACTION_SKIP,
+    ACTION_SUBMIT,
+    EXTERNAL_CONTROL_TEXTS,
+    TEXT_CANCEL,
+    TEXT_CONTINUE,
+    TEXT_LOOKUP_OTHER,
+    TEXT_PROFILE_CHANGE_CONFIRM,
+    TEXT_PROFILE_OTHER,
+    TEXT_RESTART,
+    TEXT_SKIP,
+    TEXT_SUBMIT,
+    TEXT_YES,
+)
 from app.bot.database.models import MessageDirection, Ticket, User
 from app.bot.keyboards import support_close_ticket_keyboard
 from app.bot.services.message_service import MessageService, TopicUnavailableError
@@ -72,9 +95,32 @@ class ExternalSupportProcessor:
         self.minecraft_service = minecraft_service
         self.drafts: dict[tuple[str, str], ExternalDraft] = {}
         self.platform_router.register_state_clearer(self.clear_user_state)
+        self.platform_router.register_state_reader(self.get_user_state)
 
     def clear_user_state(self, platform: str, platform_user_id: str) -> None:
         self.drafts.pop((platform, str(platform_user_id)), None)
+
+    def get_user_state(self, platform: str, platform_user_id: str) -> dict[str, Any] | None:
+        draft = self.drafts.get((platform, str(platform_user_id)))
+        if draft is None:
+            return None
+        question_id = None
+        media_count = 0
+        if draft.question_index < len(draft.form.questions):
+            question = draft.form.questions[draft.question_index]
+            question_id = question.id
+            answer = find_answer(draft.answers, question.id)
+            media_count = len(TicketService.extract_media_files(answer or {}))
+        return {
+            "state": get_external_draft_state(draft),
+            "selected_form_id": draft.form.id,
+            "current_question_index": draft.question_index,
+            "current_question_id": question_id,
+            "answers_count": len(draft.answers),
+            "media_count": media_count,
+            "pending_action": get_external_pending_action(draft),
+            "confirming": draft.confirming,
+        }
 
     async def handle_incoming(self, incoming: IncomingMessage) -> None:
         key = (incoming.platform, incoming.platform_user_id)
@@ -203,15 +249,40 @@ class ExternalSupportProcessor:
 
             draft = self.drafts.get(key)
             if draft is None:
+                logger.info(
+                    "Stale external action platform=%s platform_user_id=%s action=%s reason=missing_draft",
+                    platform,
+                    platform_user_id,
+                    action,
+                )
                 await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
                 await session.commit()
                 return
+            logger.info(
+                "External action platform=%s platform_user_id=%s action=%s current_state=%s form_id=%s question_index=%s callback_question_index=%s form_id_hint=%s",
+                platform,
+                platform_user_id,
+                action,
+                get_external_draft_state(draft),
+                draft.form.id,
+                draft.question_index,
+                question_index,
+                form_id,
+            )
             if form_id is not None and draft.form.id != form_id:
+                logger.info(
+                    "Stale external action platform=%s platform_user_id=%s action=%s reason=form_mismatch draft_form_id=%s callback_form_id=%s",
+                    platform,
+                    platform_user_id,
+                    action,
+                    draft.form.id,
+                    form_id,
+                )
                 await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
                 await session.commit()
                 return
 
-            if action == "cancel":
+            if action == ACTION_CANCEL:
                 if form_id is not None and not draft.confirming:
                     await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
                     await session.commit()
@@ -230,7 +301,7 @@ class ExternalSupportProcessor:
                 await session.commit()
                 return
 
-            if action == "restart":
+            if action == ACTION_RESTART:
                 if not draft.confirming:
                     await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
                     await session.commit()
@@ -240,7 +311,7 @@ class ExternalSupportProcessor:
                 await session.commit()
                 return
 
-            if action == "submit":
+            if action == ACTION_SUBMIT:
                 if not draft.confirming:
                     await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
                     await session.commit()
@@ -256,7 +327,7 @@ class ExternalSupportProcessor:
                 await session.commit()
                 return
 
-            if action in {"minecraft_lookup_continue", "minecraft_lookup_other"}:
+            if action in {ACTION_MINECRAFT_LOOKUP_CONTINUE, ACTION_MINECRAFT_LOOKUP_OTHER}:
                 if (
                     draft.confirming
                     or not draft.awaiting_minecraft_lookup_confirmation
@@ -267,7 +338,7 @@ class ExternalSupportProcessor:
                     await session.commit()
                     return
 
-                if action == "minecraft_lookup_continue":
+                if action == ACTION_MINECRAFT_LOOKUP_CONTINUE:
                     await self.accept_pending_minecraft_lookup_answer(session, user, draft)
                     await session.commit()
                     return
@@ -276,7 +347,7 @@ class ExternalSupportProcessor:
                 await session.commit()
                 return
 
-            if action in {"profile_change_confirm", "profile_change_cancel"}:
+            if action in {ACTION_PROFILE_NICKNAME_CHANGE_CONFIRM, ACTION_PROFILE_NICKNAME_CHANGE_CANCEL}:
                 if (
                     draft.confirming
                     or not draft.awaiting_profile_change_confirmation
@@ -287,7 +358,7 @@ class ExternalSupportProcessor:
                     await session.commit()
                     return
 
-                if action == "profile_change_confirm":
+                if action == ACTION_PROFILE_NICKNAME_CHANGE_CONFIRM:
                     draft.awaiting_profile_change_confirmation = False
                     draft.awaiting_profile_choice = False
                     await self.platform_router.send_question(
@@ -306,7 +377,7 @@ class ExternalSupportProcessor:
                 await session.commit()
                 return
 
-            if action in {"profile_yes", "profile_other"}:
+            if action in {ACTION_PROFILE_NICKNAME_YES, ACTION_PROFILE_NICKNAME_OTHER}:
                 if (
                     draft.confirming
                     or not draft.awaiting_profile_choice
@@ -323,7 +394,7 @@ class ExternalSupportProcessor:
                     await session.commit()
                     return
 
-                if action == "profile_yes":
+                if action == ACTION_PROFILE_NICKNAME_YES:
                     nickname = str(user.minecraft_nickname or "").strip()
                     if not nickname:
                         await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
@@ -366,7 +437,7 @@ class ExternalSupportProcessor:
                 return
 
             question = draft.form.questions[draft.question_index]
-            if action == "skip":
+            if action == ACTION_SKIP:
                 if question.required:
                     await self.platform_router.send_question(
                         user,
@@ -382,19 +453,38 @@ class ExternalSupportProcessor:
                 await session.commit()
                 return
 
-            if action == "continue":
+            if action == ACTION_MEDIA_CONTINUE:
                 if not question_accepts_multiple_media(question):
+                    logger.info(
+                        "Rejected external media_continue platform=%s platform_user_id=%s form_id=%s question_id=%s question_index=%s reason=not_media_question",
+                        platform,
+                        platform_user_id,
+                        draft.form.id,
+                        question.id,
+                        draft.question_index,
+                    )
                     await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
                     await session.commit()
                     return
                 answer = find_answer(draft.answers, question.id)
                 media_count = len(TicketService.extract_media_files(answer or {}))
+                logger.info(
+                    "External media_continue platform=%s platform_user_id=%s form_id=%s question_id=%s question_index=%s media_count=%s required=%s allow_multiple=%s",
+                    platform,
+                    platform_user_id,
+                    draft.form.id,
+                    question.id,
+                    draft.question_index,
+                    media_count,
+                    question.required,
+                    question.allow_multiple,
+                )
                 if media_count == 0 and question.required:
                     await self.platform_router.send_question(
                         user,
                         draft.form,
                         draft.question_index,
-                        prefix_text="Пожалуйста, прикрепите файл.",
+                        prefix_text="Пожалуйста, прикрепите хотя бы один файл.",
                         telegram_bot=self.bot,
                     )
                     await session.commit()
@@ -461,7 +551,7 @@ class ExternalSupportProcessor:
             await self.send_question_or_profile_offer(session, user, draft)
             return
 
-        if text.casefold() in {"отмена", "cancel"}:
+        if text.casefold() in TEXT_CANCEL:
             self.drafts.pop(key, None)
             await self.platform_router.send_form_menu(
                 user,
@@ -506,7 +596,7 @@ class ExternalSupportProcessor:
     ) -> None:
         raw_text = (incoming.text or "").strip()
         text = raw_text.casefold()
-        if text in {"отправить", "send", "submit", "да"}:
+        if text in TEXT_SUBMIT:
             ticket = await self.submit_ticket(session, user, draft)
             self.drafts.pop(key, None)
             await self.platform_router.send_ticket_sent(
@@ -517,12 +607,12 @@ class ExternalSupportProcessor:
             )
             return
 
-        if text in {"заново", "restart"}:
+        if text in TEXT_RESTART:
             self.drafts[key] = ExternalDraft(form=draft.form)
             await self.send_question_or_profile_offer(session, user, self.drafts[key])
             return
 
-        if text in {"отмена", "cancel"}:
+        if text in TEXT_CANCEL:
             self.drafts.pop(key, None)
             await self.platform_router.send_form_menu(
                 user,
@@ -553,7 +643,7 @@ class ExternalSupportProcessor:
         question = draft.form.questions[draft.question_index]
         text = (incoming.text or "").strip()
         normalized_text = text.casefold()
-        if normalized_text in {"пропустить", "skip"}:
+        if normalized_text in TEXT_SKIP:
             if question.required:
                 await self.platform_router.send_question(
                     user,
@@ -566,23 +656,23 @@ class ExternalSupportProcessor:
             draft.answers.append(build_skipped_answer(question))
             await self.advance_or_summary(session, user, draft)
             return
-        if normalized_text in {"отправить", "send", "submit", "да", "заново", "restart"}:
+        if normalized_text in TEXT_SUBMIT | TEXT_RESTART:
             await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
             return
-        if normalized_text in {"продолжить", "continue", "далее"} and not question_accepts_multiple_media(question):
+        if normalized_text in TEXT_CONTINUE and not question_accepts_multiple_media(question):
             await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
             return
 
         if question_accepts_multiple_media(question):
             answer = find_answer(draft.answers, question.id)
-            if normalized_text in {"продолжить", "continue", "далее"}:
+            if normalized_text in TEXT_CONTINUE:
                 media_count = len(TicketService.extract_media_files(answer or {}))
                 if media_count == 0 and question.required:
                     await self.platform_router.send_question(
                         user,
                         draft.form,
                         draft.question_index,
-                        prefix_text="Пожалуйста, прикрепите файл.",
+                        prefix_text="Пожалуйста, прикрепите хотя бы один файл.",
                         telegram_bot=self.bot,
                     )
                     return
@@ -596,6 +686,17 @@ class ExternalSupportProcessor:
                 media_count = len(TicketService.extract_media_files(find_answer(draft.answers, question.id) or {}))
                 max_files = question.max_files
                 limit_reached = max_files is not None and media_count >= max_files
+                logger.info(
+                    "External media added user_id=%s platform=%s platform_user_id=%s form_id=%s question_id=%s question_index=%s media_count=%s attachments_in_message=%s",
+                    user.id,
+                    user.platform,
+                    user.platform_user_id,
+                    draft.form.id,
+                    question.id,
+                    draft.question_index,
+                    media_count,
+                    len(incoming.attachments),
+                )
                 await self.platform_router.send_media_continue(
                     user,
                     draft.question_index,
@@ -688,6 +789,19 @@ class ExternalSupportProcessor:
         draft.awaiting_profile_change_confirmation = False
         draft.awaiting_minecraft_lookup_confirmation = False
         draft.pending_minecraft_answer = None
+        logger.info(
+            "Sending external question user_id=%s platform=%s platform_user_id=%s form_id=%s question_id=%s question_index=%s answer_type=%s allow_multiple=%s max_files=%s state=%s",
+            user.id,
+            user.platform,
+            user.platform_user_id,
+            draft.form.id,
+            question.id,
+            draft.question_index,
+            question.answer_type,
+            question.allow_multiple,
+            question.max_files,
+            get_external_draft_state(draft),
+        )
         await self.platform_router.send_question(user, draft.form, draft.question_index, telegram_bot=self.bot)
 
     async def handle_profile_choice_text(self, session: AsyncSession, user: User, incoming: IncomingMessage, draft: ExternalDraft) -> None:
@@ -697,7 +811,7 @@ class ExternalSupportProcessor:
 
         question = draft.form.questions[draft.question_index]
         text = (incoming.text or "").strip().casefold()
-        if text in {"да", "yes", "y"}:
+        if text in TEXT_YES:
             nickname = str(user.minecraft_nickname or "").strip()
             if not nickname or not is_minecraft_nickname_question(question):
                 await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
@@ -722,7 +836,7 @@ class ExternalSupportProcessor:
             await self.advance_or_summary(session, user, draft)
             return
 
-        if text in {"изменить ник", "ввести другой", "другой", "нет", "no"}:
+        if text in TEXT_PROFILE_OTHER:
             await self.begin_minecraft_nickname_change(user, draft)
             return
 
@@ -905,10 +1019,10 @@ class ExternalSupportProcessor:
         draft: ExternalDraft,
     ) -> None:
         text = (incoming.text or "").strip().casefold()
-        if text in {"продолжить", "continue", "далее"}:
+        if text in TEXT_CONTINUE:
             await self.accept_pending_minecraft_lookup_answer(session, user, draft)
             return
-        if text in {"ввести другой", "другой", "нет", "no"}:
+        if text in TEXT_LOOKUP_OTHER:
             await self.return_to_minecraft_question(user, draft)
             return
         await self.platform_router.send_text(user, "Напишите: Продолжить или Ввести другой.", telegram_bot=self.bot)
@@ -921,7 +1035,7 @@ class ExternalSupportProcessor:
         draft: ExternalDraft,
     ) -> None:
         text = (incoming.text or "").strip().casefold()
-        if text in {"да", "да, изменить", "изменить", "yes", "y"}:
+        if text in TEXT_PROFILE_CHANGE_CONFIRM:
             draft.awaiting_profile_change_confirmation = False
             await self.platform_router.send_question(
                 user,
@@ -931,7 +1045,7 @@ class ExternalSupportProcessor:
                 telegram_bot=self.bot,
             )
             return
-        if text in {"отмена", "cancel"}:
+        if text in TEXT_CANCEL:
             draft.awaiting_profile_change_confirmation = False
             await self.apply_saved_minecraft_nickname(session, user, draft)
             return
@@ -1269,32 +1383,44 @@ def find_answer(answers: list[dict[str, Any]], question_id: str) -> dict[str, An
     return next((answer for answer in answers if answer.get("question_id") == question_id), None)
 
 
+def get_external_draft_state(draft: ExternalDraft) -> str:
+    if draft.confirming:
+        return "preview"
+    if draft.awaiting_profile_choice:
+        return "confirming_nickname"
+    if draft.awaiting_profile_change_confirmation:
+        return "confirming_nickname_change"
+    if draft.awaiting_minecraft_lookup_confirmation:
+        return "confirming_not_found_nickname"
+    if draft.question_index < len(draft.form.questions):
+        question = draft.form.questions[draft.question_index]
+        if question_accepts_multiple_media(question) and find_answer(draft.answers, question.id) is not None:
+            return "collecting_media"
+    return "answering"
+
+
+def get_external_pending_action(draft: ExternalDraft) -> str | None:
+    if draft.awaiting_profile_choice:
+        return "nickname_choice"
+    if draft.awaiting_profile_change_confirmation:
+        return "nickname_change_confirmation"
+    if draft.awaiting_minecraft_lookup_confirmation:
+        return "minecraft_lookup_confirmation"
+    if draft.confirming:
+        return "ticket_preview"
+    if draft.question_index < len(draft.form.questions):
+        question = draft.form.questions[draft.question_index]
+        if question_accepts_multiple_media(question):
+            return "media_continue"
+    return None
+
+
 def question_accepts_multiple_media(question: TicketQuestion) -> bool:
     return question.allow_multiple and question.answer_type in {ANSWER_TYPE_MEDIA, ANSWER_TYPE_ANY}
 
 
 def is_external_control_text(text: str) -> bool:
-    return (text or "").strip().casefold() in {
-        "отправить",
-        "send",
-        "submit",
-        "да",
-        "да, изменить",
-        "изменить",
-        "изменить ник",
-        "ввести другой",
-        "другой",
-        "нет",
-        "заново",
-        "restart",
-        "отмена",
-        "cancel",
-        "продолжить",
-        "continue",
-        "далее",
-        "пропустить",
-        "skip",
-    }
+    return (text or "").strip().casefold() in EXTERNAL_CONTROL_TEXTS
 
 
 def build_question_text(question: TicketQuestion) -> str:

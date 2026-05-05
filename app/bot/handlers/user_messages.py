@@ -16,6 +16,17 @@ from aiogram.types import CallbackQuery, InputMediaPhoto, InputMediaVideo, Messa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot.config import Settings
+from app.bot.constants.actions import (
+    TEXT_CANCEL,
+    TEXT_CONTINUE,
+    TEXT_LOOKUP_OTHER,
+    TEXT_PROFILE_CHANGE_CONFIRM,
+    TEXT_PROFILE_OTHER,
+    TEXT_RESTART,
+    TEXT_SKIP,
+    TEXT_SUBMIT,
+    TEXT_YES,
+)
 from app.bot.database.models import MessageDirection, Ticket, TicketStatus, User
 from app.bot.keyboards import (
     CALLBACK_CANCEL_TICKET,
@@ -96,6 +107,7 @@ class TicketFlow(StatesGroup):
     profile_change_confirm = State()
     minecraft_lookup_confirm = State()
     answering = State()
+    collecting_media = State()
     confirming = State()
 
 
@@ -280,19 +292,19 @@ async def handle_minecraft_nickname_choice_text(
     question_index = int(data.get("question_index", 0))
     text = (message.text or "").strip().casefold()
 
-    if text in {"да", "yes", "y"}:
+    if text in TEXT_YES:
         if await apply_saved_minecraft_nickname(message, session, state, ticket_form_service, minecraft_service, user, settings):
             return
         await message.answer("Это действие уже неактуально.")
         return
 
-    if text in {"изменить ник", "ввести другой", "другой", "нет", "no"}:
+    if text in TEXT_PROFILE_OTHER:
         if await begin_minecraft_nickname_change(message, session, state, ticket_form_service, user, settings):
             return
         await message.answer("Это действие уже неактуально.")
         return
 
-    if text in {"отмена", "cancel"}:
+    if text in TEXT_CANCEL:
         if form is not None:
             await TicketService(session, settings.support_chat_id).create_cancelled_ticket(
                 user,
@@ -380,7 +392,7 @@ async def handle_minecraft_nickname_change_confirm_text(
     if await try_start_form_from_text_if_no_active_ticket(message, session, settings, state, ticket_form_service, minecraft_service, user):
         return
     text = (message.text or "").strip().casefold()
-    if text in {"да", "да, изменить", "изменить", "yes", "y"}:
+    if text in TEXT_PROFILE_CHANGE_CONFIRM:
         data = await state.get_data()
         form = get_state_form(ticket_form_service, data)
         question_index = int(data.get("question_index", 0))
@@ -393,7 +405,7 @@ async def handle_minecraft_nickname_change_confirm_text(
         await ask_current_question(message, form, question_index, prefix_text="Введите новый игровой ник:")
         return
 
-    if text in {"отмена", "cancel"}:
+    if text in TEXT_CANCEL:
         if await apply_saved_minecraft_nickname(message, session, state, ticket_form_service, minecraft_service, user, settings):
             return
         await state.clear()
@@ -448,6 +460,7 @@ async def handle_minecraft_lookup_confirmation_text(
     settings: Settings,
     state: FSMContext,
     ticket_form_service: TicketFormService,
+    minecraft_service: MinecraftService,
     known_user: User | None = None,
 ) -> None:
     if message.from_user is None or message.from_user.is_bot:
@@ -459,17 +472,17 @@ async def handle_minecraft_lookup_confirmation_text(
     user = await get_or_create_user(session, message.from_user, known_user)
     if await try_start_form_from_text_if_no_active_ticket(message, session, settings, state, ticket_form_service, minecraft_service, user):
         return
-    if text in {"продолжить", "continue", "далее"}:
+    if text in TEXT_CONTINUE:
         if await accept_pending_minecraft_lookup_answer(message, session, state, ticket_form_service, minecraft_service, user, settings):
             return
         await message.answer("Это действие уже неактуально.")
         return
-    if text in {"ввести другой", "другой", "нет", "no"}:
+    if text in TEXT_LOOKUP_OTHER:
         if await return_to_minecraft_question(message, state, ticket_form_service):
             return
         await message.answer("Это действие уже неактуально.")
         return
-    if text in {"отмена", "cancel"}:
+    if text in TEXT_CANCEL:
         data = await state.get_data()
         form = get_state_form(ticket_form_service, data)
         if form is not None:
@@ -491,7 +504,7 @@ async def handle_minecraft_lookup_confirmation_text(
     )
 
 
-@router.message(StateFilter(TicketFlow.answering), F.chat.type == ChatType.PRIVATE)
+@router.message(StateFilter(TicketFlow.answering, TicketFlow.collecting_media), F.chat.type == ChatType.PRIVATE)
 async def handle_form_answer(
     message: Message,
     session: AsyncSession,
@@ -527,6 +540,74 @@ async def handle_form_answer(
         await show_ticket_forms(message, ticket_form_service)
         return
     question = form.questions[question_index]
+    logger.info(
+        "Telegram form answer user_id=%s platform=telegram current_state=%s form_id=%s question_id=%s question_index=%s answer_type=%s allow_multiple=%s max_files=%s",
+        user.id,
+        await state.get_state(),
+        form.id,
+        question.id,
+        question_index,
+        question.answer_type,
+        question.allow_multiple,
+        question.max_files,
+    )
+    normalized_text = (message.text or "").strip().casefold()
+    if normalized_text in TEXT_CANCEL:
+        await TicketService(session, settings.support_chat_id).create_cancelled_ticket(
+            user,
+            form,
+            list(data.get("answers", [])),
+        )
+        await state.clear()
+        await message.answer(
+            CANCELLED_TEXT,
+            reply_markup=ticket_forms_reply_keyboard(ticket_form_service.get_forms()) if ticket_form_service.enabled else None,
+        )
+        return
+
+    if normalized_text in TEXT_SKIP:
+        if question.required:
+            await message.answer(
+                f"Это обязательный вопрос.\n\n{build_question_text(question)}",
+                reply_markup=get_question_reply_markup(question, question_index),
+            )
+            return
+        answers = list(data.get("answers", []))
+        answers.append(build_skipped_answer(question))
+        await clear_media_collection_data(state)
+        await move_to_next_question_or_summary(
+            message,
+            state,
+            form,
+            answers,
+            question_index + 1,
+            user=user,
+            settings=settings,
+            session=session,
+            ticket_form_service=ticket_form_service,
+            minecraft_service=minecraft_service,
+        )
+        return
+
+    if question_accepts_multiple_media(question) and normalized_text in TEXT_CONTINUE:
+        await handle_continue_multiple_media_text(
+            message=message,
+            state=state,
+            form=form,
+            question=question,
+            question_index=question_index,
+            user=user,
+            settings=settings,
+            session=session,
+            ticket_form_service=ticket_form_service,
+            minecraft_service=minecraft_service,
+        )
+        return
+
+    if normalized_text in (TEXT_SUBMIT - TEXT_YES) | TEXT_RESTART:
+        await message.answer("Это действие уже неактуально.")
+        return
+
     raw_answer = extract_ticket_answer(message)
 
     if raw_answer and raw_answer.get("file_id") and message.media_group_id and not question_accepts_multiple_media(question):
@@ -672,7 +753,6 @@ async def skip_question(
 
 
 @router.callback_query(
-    StateFilter(TicketFlow.answering),
     (F.data == CALLBACK_CONTINUE_MEDIA) | F.data.startswith(f"{CALLBACK_CONTINUE_MEDIA}:"),
 )
 async def continue_multiple_media_question(
@@ -718,35 +798,74 @@ async def handle_continue_multiple_media_question(
         await callback.answer("Подождите, файлы ещё добавляются.", show_alert=True)
         return
 
+    current_state = await state.get_state()
     data = await state.get_data()
     form = get_state_form(ticket_form_service, data)
     if form is None:
-        await state.clear()
-        await callback.answer("Форма устарела. Откройте тикет заново.", show_alert=True)
+        await reject_continue_media_action(
+            callback,
+            current_state=current_state,
+            data=data,
+            reason="missing_form",
+        )
         return
 
     question_index = int(data.get("question_index", 0))
     if question_index >= len(form.questions):
-        await state.clear()
-        await callback.answer("Форма устарела. Откройте тикет заново.", show_alert=True)
+        await reject_continue_media_action(
+            callback,
+            current_state=current_state,
+            data=data,
+            reason="question_index_finished",
+            form_id=form.id,
+            question_index=question_index,
+        )
         return
 
     callback_question_index = parse_continue_media_question_index(callback.data)
     if callback_question_index is not None and callback_question_index != question_index:
-        await callback.answer("Действие устарело.", show_alert=True)
+        await reject_continue_media_action(
+            callback,
+            current_state=current_state,
+            data=data,
+            reason="question_index_mismatch",
+            form_id=form.id,
+            question_index=question_index,
+            callback_question_index=callback_question_index,
+        )
         return
 
     question = form.questions[question_index]
     if not question_accepts_multiple_media(question):
-        await callback.answer("Действие устарело.", show_alert=True)
+        await reject_continue_media_action(
+            callback,
+            current_state=current_state,
+            data=data,
+            reason="not_multiple_media_question",
+            form_id=form.id,
+            question_index=question_index,
+            question_id=question.id,
+        )
         return
 
     answers = list(data.get("answers", []))
     media_count = get_current_media_count(answers, question)
+    logger.info(
+        "Telegram media_continue user_id=%s platform=telegram current_state=%s form_id=%s question_id=%s question_index=%s media_count=%s required=%s allow_multiple=%s max_files=%s",
+        user.id,
+        current_state,
+        form.id,
+        question.id,
+        question_index,
+        media_count,
+        question.required,
+        question.allow_multiple,
+        question.max_files,
+    )
     if media_count == 0:
         if question.required:
             await message.answer(
-                f"Пожалуйста, прикрепите файл.\n\n{build_question_text(question)}",
+                f"Пожалуйста, прикрепите хотя бы один файл.\n\n{build_question_text(question)}",
                 reply_markup=multiple_media_keyboard(question_index),
             )
             await callback.answer()
@@ -754,6 +873,8 @@ async def handle_continue_multiple_media_question(
 
         answers.append(build_skipped_answer(question))
 
+    await clear_media_collection_data(state)
+    await state.set_state(TicketFlow.answering)
     await move_to_next_question_or_summary(
         message,
         state,
@@ -767,6 +888,63 @@ async def handle_continue_multiple_media_question(
         minecraft_service=minecraft_service,
     )
     await callback.answer()
+
+
+async def handle_continue_multiple_media_text(
+    *,
+    message: Message,
+    state: FSMContext,
+    form: TicketForm,
+    question: TicketQuestion,
+    question_index: int,
+    user: User,
+    settings: Settings,
+    session: AsyncSession,
+    ticket_form_service: TicketFormService,
+    minecraft_service: MinecraftService,
+) -> None:
+    if message.from_user is not None and await has_pending_media_group(message.from_user.id):
+        await message.answer("Подождите, файлы ещё добавляются.")
+        return
+
+    data = await state.get_data()
+    answers = list(data.get("answers", []))
+    media_count = get_current_media_count(answers, question)
+    logger.info(
+        "Telegram media_continue_text user_id=%s platform=telegram current_state=%s form_id=%s question_id=%s question_index=%s media_count=%s required=%s allow_multiple=%s max_files=%s",
+        user.id,
+        await state.get_state(),
+        form.id,
+        question.id,
+        question_index,
+        media_count,
+        question.required,
+        question.allow_multiple,
+        question.max_files,
+    )
+    if media_count == 0:
+        if question.required:
+            await message.answer(
+                f"Пожалуйста, прикрепите хотя бы один файл.\n\n{build_question_text(question)}",
+                reply_markup=multiple_media_keyboard(question_index),
+            )
+            return
+        answers.append(build_skipped_answer(question))
+
+    await clear_media_collection_data(state)
+    await state.set_state(TicketFlow.answering)
+    await move_to_next_question_or_summary(
+        message,
+        state,
+        form,
+        answers,
+        question_index + 1,
+        user=user,
+        settings=settings,
+        session=session,
+        ticket_form_service=ticket_form_service,
+        minecraft_service=minecraft_service,
+    )
 
 
 @router.callback_query(StateFilter(TicketFlow.confirming), F.data == CALLBACK_RESTART_TICKET)
@@ -965,8 +1143,16 @@ async def submit_ticket(
     | (F.data == CALLBACK_CONTINUE_MEDIA)
     | F.data.startswith(f"{CALLBACK_CONTINUE_MEDIA}:")
 )
-async def stale_ticket_action(callback: CallbackQuery) -> None:
-    await callback.answer("Действие устарело. Откройте тикет заново.", show_alert=True)
+async def stale_ticket_action(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    logger.info(
+        "Stale Telegram ticket action user_id=%s action=%s current_state=%s fsm_data_keys=%s",
+        callback.from_user.id,
+        callback.data,
+        await state.get_state(),
+        sorted(data.keys()),
+    )
+    await callback.answer("Это действие уже неактуально.", show_alert=True)
 
 
 @router.message(F.chat.type == ChatType.PRIVATE)
@@ -1088,7 +1274,13 @@ async def move_to_next_question_or_summary(
     minecraft_service: MinecraftService | None = None,
 ) -> None:
     if next_question_index < len(form.questions):
-        await state.update_data(answers=answers, question_index=next_question_index)
+        next_question = form.questions[next_question_index]
+        await state.update_data(
+            answers=answers,
+            question_index=next_question_index,
+            current_question_index=next_question_index,
+            current_question_id=next_question.id,
+        )
         if user is not None and settings is not None:
             await ask_question_entry(
                 message,
@@ -1106,7 +1298,13 @@ async def move_to_next_question_or_summary(
         return
 
     await state.set_state(TicketFlow.confirming)
-    await state.update_data(answers=answers, question_index=next_question_index)
+    await clear_media_collection_data(state)
+    await state.update_data(
+        answers=answers,
+        question_index=next_question_index,
+        current_question_index=None,
+        current_question_id=None,
+    )
     await message.answer(
         TicketService.build_user_summary_text(form, answers),
         reply_markup=ticket_summary_keyboard(),
@@ -1115,6 +1313,15 @@ async def move_to_next_question_or_summary(
 
 async def ask_current_question(message: Message, form: TicketForm, question_index: int, prefix_text: str | None = None) -> None:
     question = form.questions[question_index]
+    logger.info(
+        "Sending Telegram question platform=telegram form_id=%s question_id=%s question_index=%s answer_type=%s allow_multiple=%s max_files=%s",
+        form.id,
+        question.id,
+        question_index,
+        question.answer_type,
+        question.allow_multiple,
+        question.max_files,
+    )
     text = build_question_text(question)
     if prefix_text:
         text = f"{prefix_text.strip()}\n\n{text}"
@@ -1134,6 +1341,22 @@ async def ask_question_entry(
     minecraft_service: MinecraftService | None = None,
 ) -> None:
     question = form.questions[question_index]
+    logger.info(
+        "Sending Telegram question user_id=%s platform=telegram form_id=%s question_id=%s question_index=%s answer_type=%s allow_multiple=%s max_files=%s",
+        user.id,
+        form.id,
+        question.id,
+        question_index,
+        question.answer_type,
+        question.allow_multiple,
+        question.max_files,
+    )
+    await state.update_data(
+        form_id=form.id,
+        question_index=question_index,
+        current_question_index=question_index,
+        current_question_id=question.id,
+    )
     if should_auto_apply_minecraft_nickname(settings, user, question):
         if session is not None and ticket_form_service is not None and minecraft_service is not None:
             await apply_saved_minecraft_nickname(message, session, state, ticket_form_service, minecraft_service, user, settings)
@@ -1164,7 +1387,13 @@ async def start_form_flow(
     minecraft_service: MinecraftService | None = None,
 ) -> None:
     await state.set_state(TicketFlow.answering)
-    await state.update_data(form_id=form.id, answers=[], question_index=0)
+    await state.update_data(
+        form_id=form.id,
+        answers=[],
+        question_index=0,
+        current_question_index=0,
+        current_question_id=form.questions[0].id if form.questions else None,
+    )
     await message.answer("Начинаем заполнение тикета.", reply_markup=ReplyKeyboardRemove())
     await ask_question_entry(
         message,
@@ -1460,7 +1689,9 @@ async def send_topic_message(
 
 def get_question_reply_markup(question: TicketQuestion, question_index: int) -> Any:
     if question_accepts_multiple_media(question):
-        return multiple_media_keyboard(question_index)
+        if question.required:
+            return multiple_media_keyboard(question_index)
+        return question_keyboard(required=False)
     return question_keyboard(question.required)
 
 
@@ -1566,7 +1797,7 @@ async def process_multiple_media_items(
     data = await state.get_data()
     form = get_state_form(ticket_form_service, data)
     if form is None:
-        logger.info("Ignored media group because form state is missing")
+        logger.info("Ignored media group because form state is missing fsm_data_keys=%s", sorted(data.keys()))
         return
 
     question_index = int(data.get("question_index", 0))
@@ -1601,10 +1832,31 @@ async def process_multiple_media_items(
         answers = append_media_to_current_answer(answers, question, media_item)
 
     if accepted_items:
-        await state.update_data(answers=answers)
+        await state.set_state(TicketFlow.collecting_media)
+        await state.update_data(
+            form_id=form.id,
+            answers=answers,
+            question_index=question_index,
+            current_question_index=question_index,
+            current_question_id=question.id,
+            pending_media_question_id=question.id,
+            current_media_files=get_current_media_files(answers, question),
+            allow_multiple=question.allow_multiple,
+            max_files=max_files,
+        )
 
     media_count = get_current_media_count(answers, question)
     limit_reached = max_files is not None and media_count >= max_files
+    logger.info(
+        "Telegram media added user_id=%s form_id=%s question_id=%s question_index=%s media_count=%s media_group_id=%s state=%s",
+        message.from_user.id if message.from_user else None,
+        form.id,
+        question.id,
+        question_index,
+        media_count,
+        message.media_group_id,
+        await state.get_state(),
+    )
     await message.answer(
         build_multiple_media_confirmation_text(media_count, max_files, limit_reached),
         reply_markup=multiple_media_keyboard(question_index),
@@ -1715,11 +1967,58 @@ def get_continue_media_lock(user_id: int) -> asyncio.Lock:
     return lock
 
 
+async def reject_continue_media_action(
+    callback: CallbackQuery,
+    *,
+    current_state: str | None,
+    data: dict[str, Any],
+    reason: str,
+    form_id: str | None = None,
+    question_id: str | None = None,
+    question_index: int | None = None,
+    callback_question_index: int | None = None,
+) -> None:
+    logger.info(
+        "Rejected Telegram media_continue user_id=%s platform=telegram current_state=%s form_id=%s question_id=%s question_index=%s callback_question_index=%s fsm_data_keys=%s reason=%s",
+        callback.from_user.id,
+        current_state,
+        form_id,
+        question_id,
+        question_index,
+        callback_question_index,
+        sorted(data.keys()),
+        reason,
+    )
+    await callback.answer("Это действие уже неактуально.", show_alert=True)
+
+
+async def clear_media_collection_data(state: FSMContext) -> None:
+    await state.update_data(
+        current_media_files=[],
+        pending_media_question_id=None,
+        pending_media_group_ids=[],
+        media_prompt_message_id=None,
+        allow_multiple=None,
+        max_files=None,
+    )
+
+
 def get_current_media_count(answers: list[dict[str, Any]], question: TicketQuestion) -> int:
     answer = find_answer_for_question(answers, question.id)
     if answer is None:
         return 0
     return len(TicketService.extract_media_files(answer))
+
+
+def get_current_media_files(answers: list[dict[str, Any]], question: TicketQuestion) -> list[dict[str, Any]]:
+    answer = find_answer_for_question(answers, question.id)
+    if answer is None:
+        return []
+    return [
+        dict(media)
+        for media in TicketService.extract_media_files(answer)
+        if isinstance(media, dict)
+    ]
 
 
 def find_answer_for_question(answers: list[dict[str, Any]], question_id: str) -> dict[str, Any] | None:

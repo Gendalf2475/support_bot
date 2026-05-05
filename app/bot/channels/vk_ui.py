@@ -4,6 +4,20 @@ import json
 import logging
 from typing import Any
 
+from app.bot.constants.actions import (
+    ACTION_CANCEL,
+    ACTION_MEDIA_CONTINUE,
+    ACTION_MINECRAFT_LOOKUP_CONTINUE,
+    ACTION_MINECRAFT_LOOKUP_OTHER,
+    ACTION_PROFILE_NICKNAME_CHANGE_CANCEL,
+    ACTION_PROFILE_NICKNAME_CHANGE_CONFIRM,
+    ACTION_PROFILE_NICKNAME_OTHER,
+    ACTION_PROFILE_NICKNAME_YES,
+    ACTION_RESTART,
+    ACTION_SELECT_FORM,
+    ACTION_SKIP,
+    ACTION_SUBMIT,
+)
 from app.bot.services.ticket_form_service import (
     ANSWER_TYPE_MEDIA,
     PROFILE_FIELD_MINECRAFT_NICKNAME,
@@ -26,7 +40,7 @@ def build_form_keyboard(forms: list[TicketForm]) -> str:
         logger.warning("VK keyboard MVP shows only first %s forms", VK_FORM_BUTTON_LIMIT)
     return _keyboard(
         [
-            [_button(form.button_text, "primary", {"action": "select_form", "form_id": form.id})]
+            [_button(form.button_text, "primary", {"action": ACTION_SELECT_FORM, "form_id": form.id})]
             for form in visible_forms
         ]
     )
@@ -35,8 +49,8 @@ def build_form_keyboard(forms: list[TicketForm]) -> str:
 def build_question_keyboard(question: TicketQuestion) -> str:
     row = []
     if not question.required:
-        row.append(_button("Пропустить", "secondary", {"action": "skip"}))
-    row.append(_button("Отмена", "negative", {"action": "cancel"}))
+        row.append(_button("Пропустить", "secondary", {"action": ACTION_SKIP}))
+    row.append(_button("Отмена", "negative", {"action": ACTION_CANCEL}))
     return _keyboard([row])
 
 
@@ -44,8 +58,8 @@ def build_media_continue_keyboard() -> str:
     return _keyboard(
         [
             [
-                _button("Продолжить", "positive", {"action": "continue"}),
-                _button("Отмена", "negative", {"action": "cancel"}),
+                _button("Продолжить", "positive", {"action": ACTION_MEDIA_CONTINUE}),
+                _button("Отмена", "negative", {"action": ACTION_CANCEL}),
             ]
         ]
     )
@@ -55,8 +69,8 @@ def build_minecraft_nickname_keyboard(*, change_label: str = "Ввести др�
     return _keyboard(
         [
             [
-                _button("Да", "positive", {"action": "profile_yes"}),
-                _button(change_label, "secondary", {"action": "profile_other"}),
+                _button("Да", "positive", {"action": ACTION_PROFILE_NICKNAME_YES}),
+                _button(change_label, "secondary", {"action": ACTION_PROFILE_NICKNAME_OTHER}),
             ]
         ]
     )
@@ -66,8 +80,8 @@ def build_minecraft_nickname_change_confirm_keyboard() -> str:
     return _keyboard(
         [
             [
-                _button("Да, изменить", "negative", {"action": "profile_change_confirm"}),
-                _button("Отмена", "secondary", {"action": "profile_change_cancel"}),
+                _button("Да, изменить", "negative", {"action": ACTION_PROFILE_NICKNAME_CHANGE_CONFIRM}),
+                _button("Отмена", "secondary", {"action": ACTION_PROFILE_NICKNAME_CHANGE_CANCEL}),
             ]
         ]
     )
@@ -77,8 +91,8 @@ def build_minecraft_lookup_confirmation_keyboard() -> str:
     return _keyboard(
         [
             [
-                _button("Продолжить", "positive", {"action": "minecraft_lookup_continue"}),
-                _button("Ввести другой", "secondary", {"action": "minecraft_lookup_other"}),
+                _button("Продолжить", "positive", {"action": ACTION_MINECRAFT_LOOKUP_CONTINUE}),
+                _button("Ввести другой", "secondary", {"action": ACTION_MINECRAFT_LOOKUP_OTHER}),
             ]
         ]
     )
@@ -87,9 +101,9 @@ def build_minecraft_lookup_confirmation_keyboard() -> str:
 def build_preview_keyboard() -> str:
     return _keyboard(
         [
-            [_button("Отправить", "positive", {"action": "submit"})],
-            [_button("Заполнить заново", "secondary", {"action": "restart"})],
-            [_button("Отмена", "negative", {"action": "cancel"})],
+            [_button("Отправить", "positive", {"action": ACTION_SUBMIT})],
+            [_button("Заполнить заново", "secondary", {"action": ACTION_RESTART})],
+            [_button("Отмена", "negative", {"action": ACTION_CANCEL})],
         ]
     )
 

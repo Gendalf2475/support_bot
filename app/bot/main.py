@@ -58,6 +58,7 @@ async def main() -> None:
     ticket_scheduler = TicketMaintenanceScheduler(bot, sessionmaker, settings, ticket_form_service, platform_router)
 
     dispatcher["settings"] = settings
+    dispatcher["dispatcher"] = dispatcher
     dispatcher["ticket_form_service"] = ticket_form_service
     dispatcher["platform_router"] = platform_router
     dispatcher["minecraft_service"] = minecraft_service
