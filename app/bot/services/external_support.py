@@ -15,7 +15,16 @@ from app.bot.database.models import MessageDirection, Ticket, User
 from app.bot.keyboards import support_close_ticket_keyboard
 from app.bot.services.message_service import MessageService, TopicUnavailableError
 from app.bot.services.platform_router import PlatformRouter
-from app.bot.services.ticket_form_service import ANSWER_TYPE_ANY, ANSWER_TYPE_MEDIA, ANSWER_TYPE_TEXT, TicketForm, TicketFormService, TicketQuestion
+from app.bot.services.ticket_form_service import (
+    ANSWER_TYPE_ANY,
+    ANSWER_TYPE_MEDIA,
+    ANSWER_TYPE_TEXT,
+    TicketForm,
+    TicketFormService,
+    TicketQuestion,
+    is_minecraft_nickname_question,
+    validate_profile_text_answer,
+)
 from app.bot.services.ticket_formatter import TicketFormatter
 from app.bot.services.ticket_service import TicketService
 from app.bot.services.topic_service import TopicCreationError, TopicService
@@ -36,6 +45,7 @@ class ExternalDraft:
     question_index: int = 0
     answers: list[dict[str, Any]] = field(default_factory=list)
     confirming: bool = False
+    awaiting_profile_choice: bool = False
 
 
 class ExternalSupportProcessor:
@@ -143,7 +153,7 @@ class ExternalSupportProcessor:
                 return
 
             self.drafts[key] = ExternalDraft(form=form)
-            await self.platform_router.send_question(user, form, 0, telegram_bot=self.bot)
+            await self.send_question_or_profile_offer(user, self.drafts[key])
             await session.commit()
 
     async def handle_platform_action(
@@ -216,7 +226,7 @@ class ExternalSupportProcessor:
                     await session.commit()
                     return
                 self.drafts[key] = ExternalDraft(form=draft.form)
-                await self.platform_router.send_question(user, draft.form, 0, telegram_bot=self.bot)
+                await self.send_question_or_profile_offer(user, self.drafts[key])
                 await session.commit()
                 return
 
@@ -233,6 +243,52 @@ class ExternalSupportProcessor:
                     success_text=TicketService.build_success_text(draft.form, ticket, user),
                     telegram_bot=self.bot,
                 )
+                await session.commit()
+                return
+
+            if action in {"profile_yes", "profile_other"}:
+                if (
+                    draft.confirming
+                    or not draft.awaiting_profile_choice
+                    or draft.question_index >= len(draft.form.questions)
+                    or (question_index is not None and question_index != draft.question_index)
+                ):
+                    await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
+                    await session.commit()
+                    return
+
+                question = draft.form.questions[draft.question_index]
+                if not is_minecraft_nickname_question(question):
+                    await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
+                    await session.commit()
+                    return
+
+                if action == "profile_yes":
+                    nickname = str(user.minecraft_nickname or "").strip()
+                    if not nickname:
+                        await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
+                        await session.commit()
+                        return
+                    validation_error = validate_profile_text_answer(question, nickname)
+                    if validation_error:
+                        draft.awaiting_profile_choice = False
+                        await self.platform_router.send_question(
+                            user,
+                            draft.form,
+                            draft.question_index,
+                            prefix_text=validation_error,
+                            telegram_bot=self.bot,
+                        )
+                        await session.commit()
+                        return
+                    draft.awaiting_profile_choice = False
+                    draft.answers.append(build_text_answer(question, nickname))
+                    await self.advance_or_summary(user, draft)
+                    await session.commit()
+                    return
+
+                draft.awaiting_profile_choice = False
+                await self.platform_router.send_question(user, draft.form, draft.question_index, telegram_bot=self.bot)
                 await session.commit()
                 return
 
@@ -337,7 +393,7 @@ class ExternalSupportProcessor:
                 return
             draft = ExternalDraft(form=form)
             self.drafts[key] = draft
-            await self.platform_router.send_question(user, form, 0, telegram_bot=self.bot)
+            await self.send_question_or_profile_offer(user, draft)
             return
 
         if text.casefold() in {"отмена", "cancel"}:
@@ -348,6 +404,10 @@ class ExternalSupportProcessor:
                 text=CANCELLED_TEXT,
                 telegram_bot=self.bot,
             )
+            return
+
+        if draft.awaiting_profile_choice:
+            await self.handle_profile_choice_text(user, incoming, draft)
             return
 
         if draft.confirming:
@@ -379,7 +439,7 @@ class ExternalSupportProcessor:
 
         if text in {"заново", "restart"}:
             self.drafts[key] = ExternalDraft(form=draft.form)
-            await self.platform_router.send_question(user, draft.form, 0, telegram_bot=self.bot)
+            await self.send_question_or_profile_offer(user, self.drafts[key])
             return
 
         if text in {"отмена", "cancel"}:
@@ -490,17 +550,78 @@ class ExternalSupportProcessor:
             return
 
         draft.answers.append(answer)
+        await maybe_save_minecraft_nickname(session, user, question, answer)
         await self.advance_or_summary(user, draft)
 
     async def advance_or_summary(self, user: User, draft: ExternalDraft) -> None:
         draft.question_index += 1
         if draft.question_index < len(draft.form.questions):
-            await self.platform_router.send_question(user, draft.form, draft.question_index, telegram_bot=self.bot)
+            await self.send_question_or_profile_offer(user, draft)
             return
         await self.show_summary(user, draft)
 
+    async def send_question_or_profile_offer(self, user: User, draft: ExternalDraft) -> None:
+        if draft.question_index >= len(draft.form.questions):
+            await self.show_summary(user, draft)
+            return
+
+        question = draft.form.questions[draft.question_index]
+        if should_offer_minecraft_nickname(self.settings, user, question):
+            draft.awaiting_profile_choice = True
+            await self.platform_router.send_minecraft_nickname_offer(
+                user,
+                draft.question_index,
+                str(user.minecraft_nickname),
+                telegram_bot=self.bot,
+            )
+            return
+
+        draft.awaiting_profile_choice = False
+        await self.platform_router.send_question(user, draft.form, draft.question_index, telegram_bot=self.bot)
+
+    async def handle_profile_choice_text(self, user: User, incoming: IncomingMessage, draft: ExternalDraft) -> None:
+        if draft.question_index >= len(draft.form.questions):
+            await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
+            return
+
+        question = draft.form.questions[draft.question_index]
+        text = (incoming.text or "").strip().casefold()
+        if text in {"да", "yes", "y"}:
+            nickname = str(user.minecraft_nickname or "").strip()
+            if not nickname or not is_minecraft_nickname_question(question):
+                await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
+                return
+            validation_error = validate_profile_text_answer(question, nickname)
+            if validation_error:
+                draft.awaiting_profile_choice = False
+                await self.platform_router.send_question(
+                    user,
+                    draft.form,
+                    draft.question_index,
+                    prefix_text=validation_error,
+                    telegram_bot=self.bot,
+                )
+                return
+            draft.awaiting_profile_choice = False
+            draft.answers.append(build_text_answer(question, nickname))
+            await self.advance_or_summary(user, draft)
+            return
+
+        if text in {"ввести другой", "другой", "нет", "no"}:
+            draft.awaiting_profile_choice = False
+            await self.platform_router.send_question(user, draft.form, draft.question_index, telegram_bot=self.bot)
+            return
+
+        await self.platform_router.send_minecraft_nickname_offer(
+            user,
+            draft.question_index,
+            str(user.minecraft_nickname or ""),
+            telegram_bot=self.bot,
+        )
+
     async def show_summary(self, user: User, draft: ExternalDraft) -> None:
         draft.confirming = True
+        draft.awaiting_profile_choice = False
         await self.platform_router.send_ticket_preview(user, draft.form, draft.answers, telegram_bot=self.bot)
 
     async def submit_ticket(self, session: AsyncSession, user: User, draft: ExternalDraft) -> Ticket:
@@ -640,10 +761,21 @@ async def send_external_attachment_to_topic(
 def validate_external_answer(question: TicketQuestion, incoming: IncomingMessage) -> tuple[dict[str, Any], str | None]:
     text = (incoming.text or "").strip()
     attachments = incoming.attachments
+    if is_minecraft_nickname_question(question):
+        if not text:
+            return {}, "Пожалуйста, отправьте текст."
+        validation_error = validate_profile_text_answer(question, text)
+        if validation_error:
+            return {}, validation_error
+        return build_text_answer(question, text), None
+
     expected = question.answer_type or ANSWER_TYPE_ANY
     if expected == ANSWER_TYPE_TEXT:
         if not text:
             return {}, "Пожалуйста, отправьте текст."
+        validation_error = validate_profile_text_answer(question, text)
+        if validation_error:
+            return {}, validation_error
         return build_text_answer(question, text), None
     if expected == ANSWER_TYPE_MEDIA:
         if not attachments:
@@ -652,8 +784,35 @@ def validate_external_answer(question: TicketQuestion, incoming: IncomingMessage
     if attachments:
         return build_media_answer(question, attachments), None
     if text:
+        validation_error = validate_profile_text_answer(question, text)
+        if validation_error:
+            return {}, validation_error
         return build_text_answer(question, text), None
     return {}, "Отправьте текст или вложение."
+
+
+def should_offer_minecraft_nickname(settings: Settings, user: User, question: TicketQuestion) -> bool:
+    return (
+        settings.minecraft_nickname_autofill_enabled
+        and is_minecraft_nickname_question(question)
+        and bool(str(user.minecraft_nickname or "").strip())
+    )
+
+
+async def maybe_save_minecraft_nickname(
+    session: AsyncSession,
+    user: User,
+    question: TicketQuestion,
+    answer: dict[str, Any],
+) -> None:
+    if not is_minecraft_nickname_question(question):
+        return
+    if answer.get("skipped") or answer.get("answer_type") != ANSWER_TYPE_TEXT:
+        return
+    nickname = str(answer.get("answer_text") or "").strip()
+    if not nickname or user.minecraft_nickname == nickname:
+        return
+    await UserService(session).set_minecraft_nickname(user, nickname)
 
 
 def build_text_answer(question: TicketQuestion, text: str) -> dict[str, Any]:
@@ -756,6 +915,9 @@ def is_external_control_text(text: str) -> bool:
         "send",
         "submit",
         "да",
+        "ввести другой",
+        "другой",
+        "нет",
         "заново",
         "restart",
         "отмена",

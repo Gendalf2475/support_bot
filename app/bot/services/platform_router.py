@@ -115,6 +115,29 @@ class PlatformRouter:
                 logger.exception("Failed to send platform question platform=%s user_id=%s: %s", user.platform, user.id, error)
         return await self.send_text(user, build_external_question_text(form, question_index, prefix_text), telegram_bot=telegram_bot)
 
+    async def send_minecraft_nickname_offer(
+        self,
+        user: User,
+        question_index: int,
+        nickname: str,
+        *,
+        telegram_bot: Bot | None = None,
+    ) -> SentMessageRef | None:
+        adapter = self.adapters.get(user.platform)
+        sender = getattr(adapter, "send_minecraft_nickname_offer", None) if adapter is not None else None
+        if callable(sender):
+            try:
+                sent = await sender(user, question_index, nickname)
+                if sent is not None:
+                    return sent
+            except Exception as error:
+                logger.exception("Failed to send platform Minecraft nickname offer platform=%s user_id=%s: %s", user.platform, user.id, error)
+        return await self.send_text(
+            user,
+            build_minecraft_nickname_offer_text(nickname),
+            telegram_bot=telegram_bot,
+        )
+
     async def send_media_continue(
         self,
         user: User,
@@ -284,6 +307,10 @@ def build_external_question_text(form: TicketForm, question_index: int, prefix_t
     if prefix_text:
         lines = [prefix_text.strip(), ""] + lines
     return "\n".join(lines)
+
+
+def build_minecraft_nickname_offer_text(nickname: str) -> str:
+    return f"Использовать прошлый ник {nickname}?\n\nНапишите: Да или Ввести другой."
 
 
 def build_external_media_continue_text(media_count: int, max_files: int | None, limit_reached: bool = False) -> str:

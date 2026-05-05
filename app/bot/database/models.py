@@ -47,6 +47,7 @@ class User(Base):
     full_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     topic_id: Mapped[int | None] = mapped_column(Integer, unique=True, index=True, nullable=True)
     blocked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    minecraft_nickname: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

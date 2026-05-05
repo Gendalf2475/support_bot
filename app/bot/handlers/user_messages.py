@@ -21,9 +21,12 @@ from app.bot.keyboards import (
     CALLBACK_CONTINUE_MEDIA,
     CALLBACK_FORM_PREFIX,
     CALLBACK_OPEN_TICKET,
+    CALLBACK_PROFILE_NICKNAME_OTHER,
+    CALLBACK_PROFILE_NICKNAME_YES,
     CALLBACK_RESTART_TICKET,
     CALLBACK_SKIP_QUESTION,
     CALLBACK_SUBMIT_TICKET,
+    minecraft_nickname_keyboard,
     multiple_media_keyboard,
     open_ticket_keyboard,
     question_keyboard,
@@ -40,6 +43,8 @@ from app.bot.services.ticket_form_service import (
     TicketForm,
     TicketFormService,
     TicketQuestion,
+    is_minecraft_nickname_question,
+    validate_profile_text_answer,
 )
 from app.bot.services.ticket_formatter import TicketFormatter
 from app.bot.services.ticket_service import TicketService
@@ -77,6 +82,7 @@ CONTINUE_MEDIA_LOCKS: dict[int, asyncio.Lock] = {}
 
 
 class TicketFlow(StatesGroup):
+    profile_choice = State()
     answering = State()
     confirming = State()
 
@@ -182,14 +188,113 @@ async def choose_form(
         await callback.answer("Форма не найдена. Попробуйте открыть список заново.", show_alert=True)
         return
 
-    await start_form_flow(message, state, form)
+    await start_form_flow(message, state, form, user, settings)
     await callback.answer()
+
+
+@router.callback_query(StateFilter(TicketFlow.profile_choice), F.data == CALLBACK_PROFILE_NICKNAME_YES)
+async def use_saved_minecraft_nickname(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    settings: Settings,
+    state: FSMContext,
+    ticket_form_service: TicketFormService,
+    known_user: User | None = None,
+) -> None:
+    message = callback.message
+    if not isinstance(message, Message) or message.chat.type != ChatType.PRIVATE:
+        await callback.answer("Действие доступно только в личном чате с ботом.", show_alert=True)
+        return
+
+    user = await get_or_create_user(session, callback.from_user, known_user)
+    applied = await apply_saved_minecraft_nickname(message, state, ticket_form_service, user, settings)
+    await callback.answer("" if applied else "Действие устарело.", show_alert=not applied)
+
+
+@router.callback_query(StateFilter(TicketFlow.profile_choice), F.data == CALLBACK_PROFILE_NICKNAME_OTHER)
+async def enter_other_minecraft_nickname(
+    callback: CallbackQuery,
+    state: FSMContext,
+    ticket_form_service: TicketFormService,
+) -> None:
+    message = callback.message
+    if not isinstance(message, Message) or message.chat.type != ChatType.PRIVATE:
+        await callback.answer("Действие доступно только в личном чате с ботом.", show_alert=True)
+        return
+
+    data = await state.get_data()
+    form = get_state_form(ticket_form_service, data)
+    question_index = int(data.get("question_index", 0))
+    if form is None or question_index >= len(form.questions):
+        await state.clear()
+        await callback.answer("Форма устарела. Откройте тикет заново.", show_alert=True)
+        return
+
+    await state.set_state(TicketFlow.answering)
+    await ask_current_question(message, form, question_index)
+    await callback.answer()
+
+
+@router.message(StateFilter(TicketFlow.profile_choice), F.chat.type == ChatType.PRIVATE)
+async def handle_minecraft_nickname_choice_text(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+    state: FSMContext,
+    ticket_form_service: TicketFormService,
+    known_user: User | None = None,
+) -> None:
+    if message.from_user is None or message.from_user.is_bot:
+        return
+    if is_command_message(message):
+        return
+
+    user = await get_or_create_user(session, message.from_user, known_user)
+    data = await state.get_data()
+    form = get_state_form(ticket_form_service, data)
+    question_index = int(data.get("question_index", 0))
+    text = (message.text or "").strip().casefold()
+
+    if text in {"да", "yes", "y"}:
+        if await apply_saved_minecraft_nickname(message, state, ticket_form_service, user, settings):
+            return
+        await message.answer("Это действие уже неактуально.")
+        return
+
+    if text in {"ввести другой", "другой", "нет", "no"}:
+        if form is None or question_index >= len(form.questions):
+            await state.clear()
+            await show_ticket_forms(message, ticket_form_service)
+            return
+        await state.set_state(TicketFlow.answering)
+        await ask_current_question(message, form, question_index)
+        return
+
+    if text in {"отмена", "cancel"}:
+        if form is not None:
+            await TicketService(session, settings.support_chat_id).create_cancelled_ticket(
+                user,
+                form,
+                list(data.get("answers", [])),
+            )
+        await state.clear()
+        await message.answer(
+            CANCELLED_TEXT,
+            reply_markup=ticket_forms_reply_keyboard(ticket_form_service.get_forms()) if ticket_form_service.enabled else None,
+        )
+        return
+
+    await message.answer(
+        "Напишите: Да или Ввести другой.",
+        reply_markup=minecraft_nickname_keyboard(),
+    )
 
 
 @router.message(StateFilter(TicketFlow.answering), F.chat.type == ChatType.PRIVATE)
 async def handle_form_answer(
     message: Message,
     session: AsyncSession,
+    settings: Settings,
     state: FSMContext,
     ticket_form_service: TicketFormService,
     known_user: User | None = None,
@@ -280,16 +385,20 @@ async def handle_form_answer(
             "source_message_id": message.message_id,
         }
     )
+    await maybe_save_minecraft_nickname(session, user, question, answer)
     answers = list(data.get("answers", []))
     answers.append(answer)
-    await move_to_next_question_or_summary(message, state, form, answers, question_index + 1)
+    await move_to_next_question_or_summary(message, state, form, answers, question_index + 1, user=user, settings=settings)
 
 
 @router.callback_query(StateFilter(TicketFlow.answering), F.data == CALLBACK_SKIP_QUESTION)
 async def skip_question(
     callback: CallbackQuery,
+    session: AsyncSession,
+    settings: Settings,
     state: FSMContext,
     ticket_form_service: TicketFormService,
+    known_user: User | None = None,
 ) -> None:
     message = callback.message
     if not isinstance(message, Message) or message.chat.type != ChatType.PRIVATE:
@@ -315,7 +424,8 @@ async def skip_question(
 
     answers = list(data.get("answers", []))
     answers.append(build_skipped_answer(question))
-    await move_to_next_question_or_summary(message, state, form, answers, question_index + 1)
+    user = await get_or_create_user(session, callback.from_user, known_user)
+    await move_to_next_question_or_summary(message, state, form, answers, question_index + 1, user=user, settings=settings)
     await callback.answer()
 
 
@@ -325,8 +435,11 @@ async def skip_question(
 )
 async def continue_multiple_media_question(
     callback: CallbackQuery,
+    session: AsyncSession,
+    settings: Settings,
     state: FSMContext,
     ticket_form_service: TicketFormService,
+    known_user: User | None = None,
 ) -> None:
     message = callback.message
     if not isinstance(message, Message) or message.chat.type != ChatType.PRIVATE:
@@ -334,7 +447,8 @@ async def continue_multiple_media_question(
         return
 
     async with get_continue_media_lock(callback.from_user.id):
-        await handle_continue_multiple_media_question(callback, state, ticket_form_service, message)
+        user = await get_or_create_user(session, callback.from_user, known_user)
+        await handle_continue_multiple_media_question(callback, state, ticket_form_service, message, user, settings)
 
 
 async def handle_continue_multiple_media_question(
@@ -342,6 +456,8 @@ async def handle_continue_multiple_media_question(
     state: FSMContext,
     ticket_form_service: TicketFormService,
     message: Message,
+    user: User,
+    settings: Settings,
 ) -> None:
     if await has_pending_media_group(callback.from_user.id):
         await callback.answer("Подождите, файлы ещё добавляются.", show_alert=True)
@@ -383,15 +499,18 @@ async def handle_continue_multiple_media_question(
 
         answers.append(build_skipped_answer(question))
 
-    await move_to_next_question_or_summary(message, state, form, answers, question_index + 1)
+    await move_to_next_question_or_summary(message, state, form, answers, question_index + 1, user=user, settings=settings)
     await callback.answer()
 
 
 @router.callback_query(StateFilter(TicketFlow.confirming), F.data == CALLBACK_RESTART_TICKET)
 async def restart_form(
     callback: CallbackQuery,
+    session: AsyncSession,
+    settings: Settings,
     state: FSMContext,
     ticket_form_service: TicketFormService,
+    known_user: User | None = None,
 ) -> None:
     message = callback.message
     if not isinstance(message, Message) or message.chat.type != ChatType.PRIVATE:
@@ -407,7 +526,8 @@ async def restart_form(
 
     await state.set_state(TicketFlow.answering)
     await state.update_data(answers=[], question_index=0)
-    await ask_current_question(message, form, 0)
+    user = await get_or_create_user(session, callback.from_user, known_user)
+    await ask_question_entry(message, state, form, 0, user, settings)
     await callback.answer()
 
 
@@ -552,7 +672,15 @@ async def submit_ticket(
 
 
 @router.callback_query(
-    F.data.in_({CALLBACK_RESTART_TICKET, CALLBACK_SKIP_QUESTION, CALLBACK_SUBMIT_TICKET})
+    F.data.in_(
+        {
+            CALLBACK_RESTART_TICKET,
+            CALLBACK_SKIP_QUESTION,
+            CALLBACK_SUBMIT_TICKET,
+            CALLBACK_PROFILE_NICKNAME_YES,
+            CALLBACK_PROFILE_NICKNAME_OTHER,
+        }
+    )
     | (F.data == CALLBACK_CONTINUE_MEDIA)
     | F.data.startswith(f"{CALLBACK_CONTINUE_MEDIA}:")
 )
@@ -593,7 +721,7 @@ async def handle_private_message(
         if not ticket_form_service.enabled:
             await message.answer(FORMS_DISABLED_TEXT, reply_markup=ReplyKeyboardRemove())
             return
-        await start_form_flow(message, state, selected_form)
+        await start_form_flow(message, state, selected_form, user, settings)
         return
 
     if ticket is None:
@@ -660,10 +788,16 @@ async def move_to_next_question_or_summary(
     form: TicketForm,
     answers: list[dict[str, Any]],
     next_question_index: int,
+    *,
+    user: User | None = None,
+    settings: Settings | None = None,
 ) -> None:
     if next_question_index < len(form.questions):
         await state.update_data(answers=answers, question_index=next_question_index)
-        await ask_current_question(message, form, next_question_index)
+        if user is not None and settings is not None:
+            await ask_question_entry(message, state, form, next_question_index, user, settings)
+        else:
+            await ask_current_question(message, form, next_question_index)
         return
 
     await state.set_state(TicketFlow.confirming)
@@ -679,11 +813,33 @@ async def ask_current_question(message: Message, form: TicketForm, question_inde
     await message.answer(build_question_text(question), reply_markup=get_question_reply_markup(question, question_index))
 
 
-async def start_form_flow(message: Message, state: FSMContext, form: TicketForm) -> None:
+async def ask_question_entry(
+    message: Message,
+    state: FSMContext,
+    form: TicketForm,
+    question_index: int,
+    user: User,
+    settings: Settings,
+) -> None:
+    question = form.questions[question_index]
+    if should_offer_minecraft_nickname(settings, user, question):
+        await state.set_state(TicketFlow.profile_choice)
+        await state.update_data(question_index=question_index)
+        await message.answer(
+            f"Использовать прошлый ник {user.minecraft_nickname}?",
+            reply_markup=minecraft_nickname_keyboard(),
+        )
+        return
+
+    await state.set_state(TicketFlow.answering)
+    await ask_current_question(message, form, question_index)
+
+
+async def start_form_flow(message: Message, state: FSMContext, form: TicketForm, user: User, settings: Settings) -> None:
     await state.set_state(TicketFlow.answering)
     await state.update_data(form_id=form.id, answers=[], question_index=0)
     await message.answer("Начинаем заполнение тикета.", reply_markup=ReplyKeyboardRemove())
-    await ask_current_question(message, form, 0)
+    await ask_question_entry(message, state, form, 0, user, settings)
 
 
 async def show_ticket_forms(message: Message, ticket_form_service: TicketFormService) -> None:
@@ -1233,6 +1389,76 @@ async def get_or_create_user(
     return user
 
 
+def should_offer_minecraft_nickname(settings: Settings, user: User, question: TicketQuestion) -> bool:
+    return (
+        settings.minecraft_nickname_autofill_enabled
+        and is_minecraft_nickname_question(question)
+        and bool(str(user.minecraft_nickname or "").strip())
+    )
+
+
+async def apply_saved_minecraft_nickname(
+    message: Message,
+    state: FSMContext,
+    ticket_form_service: TicketFormService,
+    user: User,
+    settings: Settings,
+) -> bool:
+    data = await state.get_data()
+    form = get_state_form(ticket_form_service, data)
+    question_index = int(data.get("question_index", 0))
+    if form is None or question_index >= len(form.questions):
+        await state.clear()
+        return False
+
+    question = form.questions[question_index]
+    nickname = str(user.minecraft_nickname or "").strip()
+    if not nickname or not is_minecraft_nickname_question(question):
+        return False
+
+    validation_error = validate_profile_text_answer(question, nickname)
+    if validation_error:
+        await state.set_state(TicketFlow.answering)
+        await message.answer(
+            f"{validation_error}\n\n{build_question_text(question)}",
+            reply_markup=get_question_reply_markup(question, question_index),
+        )
+        return True
+
+    answers = list(data.get("answers", []))
+    answers.append(build_text_profile_answer(question, nickname))
+    await move_to_next_question_or_summary(
+        message,
+        state,
+        form,
+        answers,
+        question_index + 1,
+        user=user,
+        settings=settings,
+    )
+    return True
+
+
+async def maybe_save_minecraft_nickname(
+    session: AsyncSession,
+    user: User,
+    question: TicketQuestion,
+    answer: dict[str, Any],
+) -> None:
+    if not is_minecraft_nickname_question(question):
+        return
+    if answer.get("skipped"):
+        return
+    if answer.get("answer_type") != ANSWER_TYPE_TEXT:
+        return
+    nickname = str(answer.get("answer_text") or "").strip()
+    if not nickname:
+        return
+    if user.minecraft_nickname == nickname:
+        return
+    await UserService(session).set_minecraft_nickname(user, nickname)
+
+
 def extract_ticket_answer(message: Message) -> dict[str, Any] | None:
     media = extract_media(message)
     if media is not None:
@@ -1265,6 +1491,26 @@ def validate_question_answer(
     if answer is None:
         return {}, "Этот тип сообщения не поддерживается. Отправьте текст или медиа."
 
+    if is_minecraft_nickname_question(question):
+        text = str(answer.get("answer_text") or answer.get("caption") or "").strip()
+        if not text:
+            return {}, "Пожалуйста, отправьте текст."
+        validation_error = validate_profile_text_answer(question, text)
+        if validation_error:
+            return {}, validation_error
+        normalized_answer = dict(answer)
+        normalized_answer.update(
+            {
+                "answer_type": ANSWER_TYPE_TEXT,
+                "answer_text": text,
+                "file_id": None,
+                "media_type": None,
+                "caption": None,
+                "skipped": False,
+            }
+        )
+        return normalized_answer, None
+
     expected_answer_type = question.answer_type or ANSWER_TYPE_ANY
     if expected_answer_type == ANSWER_TYPE_TEXT:
         text = str(answer.get("answer_text") or answer.get("caption") or "").strip()
@@ -1282,6 +1528,9 @@ def validate_question_answer(
                 "skipped": False,
             }
         )
+        validation_error = validate_profile_text_answer(question, text)
+        if validation_error:
+            return {}, validation_error
         return normalized_answer, None
 
     if expected_answer_type == ANSWER_TYPE_MEDIA:
@@ -1296,8 +1545,26 @@ def validate_question_answer(
         return {}, "Отправьте текст или медиа."
 
     normalized_answer = dict(answer)
+    if normalized_answer.get("answer_type") == ANSWER_TYPE_TEXT:
+        text = str(normalized_answer.get("answer_text") or "").strip()
+        validation_error = validate_profile_text_answer(question, text)
+        if validation_error:
+            return {}, validation_error
     normalized_answer["skipped"] = False
     return normalized_answer, None
+
+
+def build_text_profile_answer(question: TicketQuestion, text: str) -> dict[str, Any]:
+    return {
+        "question_id": question.id,
+        "question_text": question.text,
+        "answer_type": ANSWER_TYPE_TEXT,
+        "answer_text": text,
+        "file_id": None,
+        "media_type": None,
+        "caption": None,
+        "skipped": False,
+    }
 
 
 def build_skipped_answer(question: TicketQuestion) -> dict[str, Any]:

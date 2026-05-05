@@ -132,6 +132,41 @@ class MediaContinueView(discord.ui.View):
         await self.on_action(interaction, "cancel", _parse_custom_index(interaction), None)
 
 
+class MinecraftNicknameView(discord.ui.View):
+    def __init__(self, question_index: int, owner_id: int, on_action: ActionCallback) -> None:
+        super().__init__(timeout=None)
+        self.owner_id = owner_id
+        self.on_action = on_action
+
+        yes_button = discord.ui.Button(
+            label="Да",
+            style=discord.ButtonStyle.success,
+            custom_id=f"majure_profile_nickname_yes:{question_index}",
+        )
+        yes_button.callback = self._yes_callback
+        self.add_item(yes_button)
+
+        other_button = discord.ui.Button(
+            label="Ввести другой",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"majure_profile_nickname_other:{question_index}",
+        )
+        other_button.callback = self._other_callback
+        self.add_item(other_button)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner_id:
+            return True
+        await send_interaction_notice(interaction, "Эта кнопка доступна только автору обращения.")
+        return False
+
+    async def _yes_callback(self, interaction: discord.Interaction) -> None:
+        await self.on_action(interaction, "profile_yes", _parse_custom_index(interaction), None)
+
+    async def _other_callback(self, interaction: discord.Interaction) -> None:
+        await self.on_action(interaction, "profile_other", _parse_custom_index(interaction), None)
+
+
 class TicketPreviewView(discord.ui.View):
     def __init__(self, form_id: str, owner_id: int, on_action: ActionCallback) -> None:
         super().__init__(timeout=None)
@@ -255,6 +290,14 @@ def build_media_continue_embed(
         title="Файлы добавлены",
         description=description,
         color=discord.Color.green(),
+    )
+
+
+def build_minecraft_nickname_embed(nickname: str) -> discord.Embed:
+    return discord.Embed(
+        title="Игровой ник",
+        description=f"Использовать прошлый ник {nickname}?",
+        color=discord.Color.blurple(),
     )
 
 

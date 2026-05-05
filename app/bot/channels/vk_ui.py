@@ -44,6 +44,17 @@ def build_media_continue_keyboard() -> str:
     )
 
 
+def build_minecraft_nickname_keyboard() -> str:
+    return _keyboard(
+        [
+            [
+                _button("Да", "positive", {"action": "profile_yes"}),
+                _button("Ввести другой", "secondary", {"action": "profile_other"}),
+            ]
+        ]
+    )
+
+
 def build_preview_keyboard() -> str:
     return _keyboard(
         [
@@ -112,6 +123,10 @@ def build_media_continue_text(
         f"Файлы добавлены: {media_count} из {max_files}.\n"
         "Можно отправить ещё файл или нажать «Продолжить»."
     )
+
+
+def build_minecraft_nickname_text(nickname: str) -> str:
+    return f"Использовать прошлый ник {nickname}?"
 
 
 def build_preview_text(form: TicketForm, answers: list[dict[str, Any]]) -> str:

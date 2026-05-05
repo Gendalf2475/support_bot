@@ -93,6 +93,7 @@ async def user_status(message: Message, bot: Bot, session: AsyncSession, setting
         f"Platform ID: {user.platform_user_id}\n"
         f"Username: {format_username(user)}\n"
         f"Имя: {user.full_name or 'не указано'}\n"
+        f"Minecraft-ник: {user.minecraft_nickname or 'не указан'}\n"
         f"Topic ID: {user.topic_id}\n"
         f"Blocked: {user.blocked}\n"
         f"Открытый тикет: #{open_ticket.id if open_ticket else 'нет'}\n"

@@ -37,6 +37,9 @@ forms:
         help_text: "Укажите ник точно так же, как он отображается на сервере."
         required: true
         answer_type: "text"
+        profile_field: "minecraft_nickname"
+        validation_regex: "^[A-Za-z0-9_]{3,16}$"
+        validation_error: "Введите корректный Minecraft-ник: 3–16 символов, латиница, цифры или _."
 
       - id: "last_login"
         text: "Когда вы примерно последний раз заходили на сервер?"
@@ -89,6 +92,9 @@ forms:
         help_text: "Укажите ник точно так же, как он отображается на сервере."
         required: true
         answer_type: "text"
+        profile_field: "minecraft_nickname"
+        validation_regex: "^[A-Za-z0-9_]{3,16}$"
+        validation_error: "Введите корректный Minecraft-ник: 3–16 символов, латиница, цифры или _."
 
       - id: "violator_nickname"
         text: "Введите ник нарушителя:"
@@ -138,6 +144,9 @@ forms:
         help_text: "Укажите ник точно так же, как он отображается на сервере."
         required: true
         answer_type: "text"
+        profile_field: "minecraft_nickname"
+        validation_regex: "^[A-Za-z0-9_]{3,16}$"
+        validation_error: "Введите корректный Minecraft-ник: 3–16 символов, латиница, цифры или _."
 
       - id: "message"
         text: "Опишите вашу проблему:"

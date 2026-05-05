@@ -35,7 +35,8 @@ class DiscordChannel:
         intents = discord.Intents.default()
         intents.dm_messages = True
         intents.message_content = True
-        client = discord.Client(intents=intents)
+        activity = self._build_activity(discord)
+        client = discord.Client(intents=intents, status=discord.Status.online, activity=activity)
         self.client = client
 
         @client.event
@@ -121,6 +122,21 @@ class DiscordChannel:
         discord_ui = self._discord_ui()
         embed = discord_ui.build_media_continue_embed(media_count, max_files, limit_reached=limit_reached)
         view = discord_ui.MediaContinueView(
+            question_index=question_index,
+            owner_id=int(user.platform_user_id),
+            on_action=self._handle_action,
+        )
+        return await self._send_discord_dm(user.platform_user_id, embed=embed, view=view)
+
+    async def send_minecraft_nickname_offer(
+        self,
+        user: Any,
+        question_index: int,
+        nickname: str,
+    ) -> SentMessageRef | None:
+        discord_ui = self._discord_ui()
+        embed = discord_ui.build_minecraft_nickname_embed(nickname)
+        view = discord_ui.MinecraftNicknameView(
             question_index=question_index,
             owner_id=int(user.platform_user_id),
             on_action=self._handle_action,
@@ -246,6 +262,29 @@ class DiscordChannel:
         from app.bot.channels import discord_ui
 
         return discord_ui
+
+    def _build_activity(self, discord: Any) -> Any | None:
+        activity_name = str(self.settings.discord_activity_name or "").strip()
+        if not self.settings.discord_activity_enabled or not activity_name:
+            logger.info("Discord activity disabled")
+            return None
+
+        activity_type = str(self.settings.discord_activity_type or "playing").strip().lower()
+        if activity_type == "playing":
+            activity = discord.Game(name=activity_name)
+        elif activity_type == "watching":
+            activity = discord.Activity(type=discord.ActivityType.watching, name=activity_name)
+        elif activity_type == "listening":
+            activity = discord.Activity(type=discord.ActivityType.listening, name=activity_name)
+        elif activity_type == "competing":
+            activity = discord.Activity(type=discord.ActivityType.competing, name=activity_name)
+        else:
+            logger.warning("Unknown Discord activity type: %s, fallback to playing", activity_type)
+            activity_type = "playing"
+            activity = discord.Game(name=activity_name)
+
+        logger.info("Discord activity set: %s %s", activity_type, activity_name)
+        return activity
 
     @staticmethod
     def build_incoming(message: Any) -> IncomingMessage:

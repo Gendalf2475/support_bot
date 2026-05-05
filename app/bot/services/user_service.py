@@ -157,6 +157,14 @@ class UserService:
         user.blocked = blocked
         await self.session.flush()
 
+    async def set_minecraft_nickname(self, user: User, nickname: str) -> None:
+        normalized = str(nickname or "").strip()
+        if not normalized:
+            return
+        user.minecraft_nickname = normalized
+        user.updated_at = utcnow()
+        await self.session.flush()
+
     @staticmethod
     def normalize_username(username: str | None) -> str | None:
         if not username:

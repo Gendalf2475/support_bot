@@ -12,6 +12,8 @@ CALLBACK_SUBMIT_TICKET = "ticket_submit"
 CALLBACK_RESTART_TICKET = "ticket_restart"
 CALLBACK_SKIP_QUESTION = "ticket_skip"
 CALLBACK_CONTINUE_MEDIA = "ticket_media_continue"
+CALLBACK_PROFILE_NICKNAME_YES = "ticket_profile_nickname_yes"
+CALLBACK_PROFILE_NICKNAME_OTHER = "ticket_profile_nickname_other"
 CALLBACK_FORM_PREFIX = "ticket_form:"
 CALLBACK_CLOSE_PREFIX = "ticket_close:"
 CALLBACK_CLOSE_REASON_PREFIX = "ticket_close_reason:"
@@ -69,6 +71,15 @@ def ticket_summary_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="Отправить", callback_data=CALLBACK_SUBMIT_TICKET)],
             [InlineKeyboardButton(text="Заполнить заново", callback_data=CALLBACK_RESTART_TICKET)],
             [InlineKeyboardButton(text="Отмена", callback_data=CALLBACK_CANCEL_TICKET)],
+        ]
+    )
+
+
+def minecraft_nickname_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Да", callback_data=CALLBACK_PROFILE_NICKNAME_YES)],
+            [InlineKeyboardButton(text="Ввести другой", callback_data=CALLBACK_PROFILE_NICKNAME_OTHER)],
         ]
     )
 

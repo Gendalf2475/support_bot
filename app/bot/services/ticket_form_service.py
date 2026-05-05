@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,10 @@ ANSWER_TYPE_TEXT = "text"
 ANSWER_TYPE_MEDIA = "media"
 ANSWER_TYPE_ANY = "any"
 ALLOWED_ANSWER_TYPES = {ANSWER_TYPE_TEXT, ANSWER_TYPE_MEDIA, ANSWER_TYPE_ANY}
+PROFILE_FIELD_MINECRAFT_NICKNAME = "minecraft_nickname"
+MINECRAFT_NICKNAME_QUESTION_IDS = {"nickname", "your_nickname", "minecraft_nickname", "player_nickname"}
+DEFAULT_MINECRAFT_NICKNAME_REGEX = r"^[A-Za-z0-9_]{3,16}$"
+DEFAULT_MINECRAFT_NICKNAME_VALIDATION_ERROR = "Введите корректный Minecraft-ник: 3–16 символов, латиница, цифры или _."
 
 
 @dataclass(frozen=True)
@@ -25,6 +30,9 @@ class TicketQuestion:
     help_text: str | None = None
     allow_multiple: bool = False
     max_files: int | None = 1
+    profile_field: str | None = None
+    validation_regex: str | None = None
+    validation_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -227,6 +235,9 @@ class TicketFormService:
             answer_type = str(raw_question.get("answer_type") or ANSWER_TYPE_ANY).strip().lower()
             allow_multiple = bool(raw_question.get("allow_multiple", False))
             max_files = self._parse_max_files(raw_question.get("max_files"), allow_multiple)
+            profile_field = str(raw_question.get("profile_field") or "").strip() or None
+            validation_regex = str(raw_question.get("validation_regex") or "").strip() or None
+            validation_error = str(raw_question.get("validation_error") or "").strip() or None
 
             if not question_id:
                 logger.error("Question #%s in form '%s' has empty id. Question is skipped.", index, form_label)
@@ -255,6 +266,9 @@ class TicketFormService:
                     help_text=help_text,
                     allow_multiple=allow_multiple,
                     max_files=max_files,
+                    profile_field=profile_field,
+                    validation_regex=validation_regex,
+                    validation_error=validation_error,
                 )
             )
             used_ids.add(question_id)
@@ -292,3 +306,30 @@ class TicketFormService:
                 ),
             ),
         )
+
+
+def is_minecraft_nickname_question(question: TicketQuestion) -> bool:
+    profile_field = str(question.profile_field or "").strip().lower()
+    if profile_field == PROFILE_FIELD_MINECRAFT_NICKNAME:
+        return True
+    return str(question.id or "").strip().lower() in MINECRAFT_NICKNAME_QUESTION_IDS
+
+
+def validate_profile_text_answer(question: TicketQuestion, text: str) -> str | None:
+    if not is_minecraft_nickname_question(question):
+        return None
+
+    regex = question.validation_regex or DEFAULT_MINECRAFT_NICKNAME_REGEX
+    try:
+        is_valid = re.fullmatch(regex, text) is not None
+    except re.error as error:
+        logger.error(
+            "Invalid validation_regex for question_id=%s regex=%s: %s",
+            question.id,
+            regex,
+            error,
+        )
+        is_valid = re.fullmatch(DEFAULT_MINECRAFT_NICKNAME_REGEX, text) is not None
+    if is_valid:
+        return None
+    return question.validation_error or DEFAULT_MINECRAFT_NICKNAME_VALIDATION_ERROR

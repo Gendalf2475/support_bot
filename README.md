@@ -49,11 +49,16 @@ DISCORD_ENABLED=false
 DISCORD_BOT_TOKEN=
 DISCORD_GUILD_ID=
 DISCORD_SUPPORT_MODE=dm
+DISCORD_ACTIVITY_ENABLED=true
+DISCORD_ACTIVITY_TYPE=watching
+DISCORD_ACTIVITY_NAME=Решает проблемы на MAJURE
 
 VK_ENABLED=false
 VK_GROUP_TOKEN=
 VK_GROUP_ID=
 VK_LONGPOLL_ENABLED=true
+
+MINECRAFT_NICKNAME_AUTOFILL_ENABLED=true
 ```
 
 Боту нужны права читать и отправлять сообщения, создавать topic/forum thread, писать в них и закреплять сообщения. Если права на закрепление нет, бот продолжит работать без закрепления и запишет ошибку в лог. Чтобы бот видел ответы поддержки, у BotFather отключите privacy mode через `/setprivacy` -> `Disable`.
@@ -65,7 +70,7 @@ alembic upgrade head
 python -m app.bot.main
 ```
 
-Миграции создают `users`, `message_maps`, `tickets`, `ticket_answers`, `ticket_answer_media` и добавляют поля для причин закрытия, напоминаний, автозакрытия, предупреждений, ожидания ответа пользователя, пропущенных ответов, служебных сообщений тикета, порядка медиа, `media_group_id` и омниканальных платформ. Старые Telegram-пользователи получают `platform=telegram`, а `platform_user_id` заполняется старым `telegram_id`.
+Миграции создают `users`, `message_maps`, `tickets`, `ticket_answers`, `ticket_answer_media` и добавляют поля для причин закрытия, напоминаний, автозакрытия, предупреждений, ожидания ответа пользователя, пропущенных ответов, служебных сообщений тикета, порядка медиа, `media_group_id`, омниканальных платформ и сохранённого `minecraft_nickname`. Старые Telegram-пользователи получают `platform=telegram`, а `platform_user_id` заполняется старым `telegram_id`.
 
 ## Как работает тикет
 
@@ -89,11 +94,34 @@ Telegram-пользователи работают как раньше: `/start`
 
 Discord включается переменной `DISCORD_ENABLED=true` и токеном `DISCORD_BOT_TOKEN`. Используется `discord.py 2.x`; боту нужны DM и Message Content Intent. Discord принимает DM: пользователь пишет боту, выбирает форму через select menu, отвечает на вопросы текстом и attachment-файлами, а действия формы выполняет кнопками. Ответы администрации из Telegram topic уходят пользователю в Discord DM.
 
+Активность Discord-бота настраивается через `.env`: `DISCORD_ACTIVITY_ENABLED`, `DISCORD_ACTIVITY_TYPE` и `DISCORD_ACTIVITY_NAME`. Поддерживаются типы `playing`, `watching`, `listening`, `competing`; неизвестный тип заменяется на `playing` с warning в лог. Presence Intent для этого не нужен. Отдельный логотип активности поставить нельзя: Discord использует аватарку бота из Developer Portal.
+
 VK включается переменными `VK_ENABLED=true`, `VK_GROUP_TOKEN`, `VK_GROUP_ID`. Используется VK Bot Long Poll через `vk_api`; пользователь пишет в сообщения сообщества, выбирает форму keyboard-кнопкой и отвечает текстом/вложениями. Ответы администрации из Telegram topic уходят в VK.
 
 Пользователи разных платформ не смешиваются: ключ пользователя — `platform + platform_user_id`. Telegram user `123`, Discord user `123` и VK user `123` считаются разными пользователями и получают разные topic. Названия topic содержат префикс платформы: `TG | @username`, `DS | username`, `VK | Имя | ID 123`.
 
 Карточка тикета показывает платформу, username, platform ID и имя пользователя. `/status`, `/block`, `/unblock` работают по topic и применяются именно к пользователю этой платформы.
+
+## Автозаполнение Minecraft-ника
+
+Вопрос можно пометить как профильное поле:
+
+```yaml
+questions:
+  - id: "your_nickname"
+    text: "Введите ваш игровой ник:"
+    required: true
+    answer_type: "text"
+    profile_field: "minecraft_nickname"
+    validation_regex: "^[A-Za-z0-9_]{3,16}$"
+    validation_error: "Введите корректный Minecraft-ник: 3–16 символов, латиница, цифры или _."
+```
+
+Если `profile_field` не указан, бот всё равно считает Minecraft-ником вопросы с `id`: `nickname`, `your_nickname`, `minecraft_nickname`, `player_nickname`. Введённый ник сохраняется в `users.minecraft_nickname` отдельно для каждого пользователя и платформы: Telegram, Discord и VK не смешиваются.
+
+При `MINECRAFT_NICKNAME_AUTOFILL_ENABLED=true` бот перед повторным вопросом предлагает использовать прошлый ник кнопками `Да` и `Ввести другой`. Telegram использует inline-кнопки, Discord — buttons, VK — keyboard; текстовый fallback принимает `да`, `ввести другой`, `другой`. Если настройка выключена, бот задаёт вопрос как обычный, но продолжает валидировать и сохранять новый ник для `/status` и будущего включения функции. После изменения `.env` нужен перезапуск контейнера.
+
+Для `minecraft_nickname` по умолчанию используется regex `^[A-Za-z0-9_]{3,16}$`. Его можно переопределить в YAML через `validation_regex`, а текст ошибки — через `validation_error`.
 
 ## Медиа между платформами
 
@@ -161,6 +189,9 @@ questions:
 - `answer_type` — ожидаемый тип ответа: `text`, `media` или `any`.
 - `allow_multiple` — `true`, если в вопрос можно приложить несколько медиафайлов подряд.
 - `max_files` — необязательное максимальное количество файлов для `allow_multiple: true`; если не указано, бот показывает счётчик без лимита (`Файлы добавлены: 3.`).
+- `profile_field` — необязательный профильный ключ; сейчас поддерживается `minecraft_nickname`.
+- `validation_regex` — необязательная regex-валидация текстового ответа.
+- `validation_error` — сообщение при ошибке `validation_regex`.
 
 `answer_type: text` принимает текст или caption у медиа. Если пользователь отправит медиа без текста/caption, бот попросит отправить текст.
 
@@ -208,7 +239,7 @@ questions:
 
 `/status`
 
-Показывает платформу, `platform_user_id`, username, имя, `blocked`, `topic_id`, ID открытого тикета, статус тикета и дату создания тикета.
+Показывает платформу, `platform_user_id`, username, имя, Minecraft-ник, `blocked`, `topic_id`, ID открытого тикета, статус тикета и дату создания тикета.
 
 `/close`
 
