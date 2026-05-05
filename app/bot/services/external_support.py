@@ -14,7 +14,7 @@ from app.bot.config import Settings
 from app.bot.database.models import MessageDirection, Ticket, User
 from app.bot.keyboards import support_close_ticket_keyboard
 from app.bot.services.message_service import MessageService, TopicUnavailableError
-from app.bot.services.platform_router import PlatformRouter, build_external_forms_text
+from app.bot.services.platform_router import PlatformRouter
 from app.bot.services.ticket_form_service import ANSWER_TYPE_ANY, ANSWER_TYPE_MEDIA, ANSWER_TYPE_TEXT, TicketForm, TicketFormService, TicketQuestion
 from app.bot.services.ticket_formatter import TicketFormatter
 from app.bot.services.ticket_service import TicketService
@@ -23,6 +23,11 @@ from app.bot.services.user_service import UserService
 
 
 logger = logging.getLogger(__name__)
+
+OPEN_TICKET_EXISTS_TEXT = "У вас уже есть открытый тикет. Просто напишите сообщение сюда, и поддержка его увидит."
+STALE_ACTION_TEXT = "Это действие уже неактуально."
+CANCELLED_TEXT = "Заполнение тикета отменено."
+FORMS_DISABLED_TEXT = "Система форм тикетов сейчас отключена. Попробуйте позже."
 
 
 @dataclass
@@ -71,12 +76,211 @@ class ExternalSupportProcessor:
             ticket_service = TicketService(session, self.settings.support_chat_id)
             open_ticket = await ticket_service.get_open_ticket_by_user_id(user.id)
             if open_ticket is not None:
+                text = (incoming.text or "").strip()
+                if self.resolve_form(text) is not None:
+                    await self.platform_router.send_text(user, OPEN_TICKET_EXISTS_TEXT, telegram_bot=self.bot)
+                    await session.commit()
+                    return
+                if is_external_control_text(text):
+                    await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
+                    await session.commit()
+                    return
                 await self.forward_open_ticket_message(session, user, open_ticket, incoming)
                 await ticket_service.mark_user_activity(open_ticket)
                 await session.commit()
                 return
 
             await self.handle_ticket_flow(session, user, incoming, key)
+            await session.commit()
+
+    async def handle_platform_form_selection(
+        self,
+        platform: str,
+        platform_user_id: str,
+        form_id: str,
+        *,
+        username: str | None = None,
+        full_name: str | None = None,
+    ) -> None:
+        key = (platform, platform_user_id)
+        async with self.sessionmaker() as session:
+            user_result = await UserService(session).upsert_user(
+                platform=platform,
+                platform_user_id=platform_user_id,
+                username=username,
+                full_name=full_name,
+            )
+            user = user_result.user
+            if user_result.changed and user.topic_id:
+                await TopicService(UserService(session), self.settings.support_chat_id).sync_topic_title(self.bot, user)
+
+            if user.blocked:
+                await self.platform_router.send_text(user, "Вы заблокированы службой поддержки.", telegram_bot=self.bot)
+                await session.commit()
+                return
+
+            ticket_service = TicketService(session, self.settings.support_chat_id)
+            open_ticket = await ticket_service.get_open_ticket_by_user_id(user.id)
+            if open_ticket is not None:
+                await self.platform_router.send_text(user, OPEN_TICKET_EXISTS_TEXT, telegram_bot=self.bot)
+                await session.commit()
+                return
+
+            if self.drafts.get(key) is not None:
+                await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
+                await session.commit()
+                return
+
+            if not self.ticket_form_service.enabled:
+                await self.platform_router.send_text(user, FORMS_DISABLED_TEXT, telegram_bot=self.bot)
+                await session.commit()
+                return
+
+            form = self.ticket_form_service.get_form(form_id)
+            if form is None:
+                await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
+                await session.commit()
+                return
+
+            self.drafts[key] = ExternalDraft(form=form)
+            await self.platform_router.send_question(user, form, 0, telegram_bot=self.bot)
+            await session.commit()
+
+    async def handle_platform_action(
+        self,
+        platform: str,
+        platform_user_id: str,
+        action: str,
+        *,
+        username: str | None = None,
+        full_name: str | None = None,
+        question_index: int | None = None,
+        form_id: str | None = None,
+    ) -> None:
+        key = (platform, platform_user_id)
+        async with self.sessionmaker() as session:
+            user_result = await UserService(session).upsert_user(
+                platform=platform,
+                platform_user_id=platform_user_id,
+                username=username,
+                full_name=full_name,
+            )
+            user = user_result.user
+            if user_result.changed and user.topic_id:
+                await TopicService(UserService(session), self.settings.support_chat_id).sync_topic_title(self.bot, user)
+
+            if user.blocked:
+                await self.platform_router.send_text(user, "Вы заблокированы службой поддержки.", telegram_bot=self.bot)
+                await session.commit()
+                return
+
+            ticket_service = TicketService(session, self.settings.support_chat_id)
+            open_ticket = await ticket_service.get_open_ticket_by_user_id(user.id)
+            if open_ticket is not None:
+                await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
+                await session.commit()
+                return
+
+            draft = self.drafts.get(key)
+            if draft is None:
+                await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
+                await session.commit()
+                return
+            if form_id is not None and draft.form.id != form_id:
+                await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
+                await session.commit()
+                return
+
+            if action == "cancel":
+                if form_id is not None and not draft.confirming:
+                    await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
+                    await session.commit()
+                    return
+                if question_index is not None and (draft.confirming or question_index != draft.question_index):
+                    await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
+                    await session.commit()
+                    return
+                self.drafts.pop(key, None)
+                await self.platform_router.send_form_menu(
+                    user,
+                    self.ticket_form_service.get_forms(),
+                    text=CANCELLED_TEXT,
+                    telegram_bot=self.bot,
+                )
+                await session.commit()
+                return
+
+            if action == "restart":
+                if not draft.confirming:
+                    await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
+                    await session.commit()
+                    return
+                self.drafts[key] = ExternalDraft(form=draft.form)
+                await self.platform_router.send_question(user, draft.form, 0, telegram_bot=self.bot)
+                await session.commit()
+                return
+
+            if action == "submit":
+                if not draft.confirming:
+                    await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
+                    await session.commit()
+                    return
+                ticket = await self.submit_ticket(session, user, draft)
+                self.drafts.pop(key, None)
+                await self.platform_router.send_ticket_sent(user, ticket.id, telegram_bot=self.bot)
+                await session.commit()
+                return
+
+            if draft.confirming or draft.question_index >= len(draft.form.questions):
+                await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
+                await session.commit()
+                return
+            if question_index is not None and question_index != draft.question_index:
+                await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
+                await session.commit()
+                return
+
+            question = draft.form.questions[draft.question_index]
+            if action == "skip":
+                if question.required:
+                    await self.platform_router.send_question(
+                        user,
+                        draft.form,
+                        draft.question_index,
+                        prefix_text="Это обязательный вопрос.",
+                        telegram_bot=self.bot,
+                    )
+                    await session.commit()
+                    return
+                draft.answers.append(build_skipped_answer(question))
+                await self.advance_or_summary(user, draft)
+                await session.commit()
+                return
+
+            if action == "continue":
+                if not question_accepts_multiple_media(question):
+                    await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
+                    await session.commit()
+                    return
+                answer = find_answer(draft.answers, question.id)
+                media_count = len(TicketService.extract_media_files(answer or {}))
+                if media_count == 0 and question.required:
+                    await self.platform_router.send_question(
+                        user,
+                        draft.form,
+                        draft.question_index,
+                        prefix_text="Пожалуйста, прикрепите файл.",
+                        telegram_bot=self.bot,
+                    )
+                    await session.commit()
+                    return
+                if media_count == 0:
+                    draft.answers.append(build_skipped_answer(question))
+                await self.advance_or_summary(user, draft)
+                await session.commit()
+                return
+
+            await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
             await session.commit()
 
     async def forward_open_ticket_message(
@@ -116,18 +320,29 @@ class ExternalSupportProcessor:
         text = (incoming.text or "").strip()
 
         if draft is None:
+            if is_external_control_text(text):
+                await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
+                return
+            if not self.ticket_form_service.enabled:
+                await self.platform_router.send_text(user, FORMS_DISABLED_TEXT, telegram_bot=self.bot)
+                return
             form = self.resolve_form(text)
             if form is None:
-                await self.platform_router.send_text(user, build_external_forms_text(self.ticket_form_service.get_forms()), telegram_bot=self.bot)
+                await self.platform_router.send_form_menu(user, self.ticket_form_service.get_forms(), telegram_bot=self.bot)
                 return
             draft = ExternalDraft(form=form)
             self.drafts[key] = draft
-            await self.platform_router.send_text(user, f"Начинаем заполнение тикета.\n\n{build_question_text(form.questions[0])}", telegram_bot=self.bot)
+            await self.platform_router.send_question(user, form, 0, telegram_bot=self.bot)
             return
 
         if text.casefold() in {"отмена", "cancel"}:
             self.drafts.pop(key, None)
-            await self.platform_router.send_text(user, f"Заполнение тикета отменено.\n\n{build_external_forms_text(self.ticket_form_service.get_forms())}", telegram_bot=self.bot)
+            await self.platform_router.send_form_menu(
+                user,
+                self.ticket_form_service.get_forms(),
+                text=CANCELLED_TEXT,
+                telegram_bot=self.bot,
+            )
             return
 
         if draft.confirming:
@@ -144,21 +359,31 @@ class ExternalSupportProcessor:
         key: tuple[str, str],
         draft: ExternalDraft,
     ) -> None:
-        text = (incoming.text or "").strip().casefold()
+        raw_text = (incoming.text or "").strip()
+        text = raw_text.casefold()
         if text in {"отправить", "send", "submit", "да"}:
-            await self.submit_ticket(session, user, draft)
+            ticket = await self.submit_ticket(session, user, draft)
             self.drafts.pop(key, None)
-            await self.platform_router.send_text(user, "✅ Тикет отправлен в поддержку. Ответ придёт сюда.", telegram_bot=self.bot)
+            await self.platform_router.send_ticket_sent(user, ticket.id, telegram_bot=self.bot)
             return
 
         if text in {"заново", "restart"}:
             self.drafts[key] = ExternalDraft(form=draft.form)
-            await self.platform_router.send_text(user, build_question_text(draft.form.questions[0]), telegram_bot=self.bot)
+            await self.platform_router.send_question(user, draft.form, 0, telegram_bot=self.bot)
             return
 
         if text in {"отмена", "cancel"}:
             self.drafts.pop(key, None)
-            await self.platform_router.send_text(user, f"Заполнение тикета отменено.\n\n{build_external_forms_text(self.ticket_form_service.get_forms())}", telegram_bot=self.bot)
+            await self.platform_router.send_form_menu(
+                user,
+                self.ticket_form_service.get_forms(),
+                text=CANCELLED_TEXT,
+                telegram_bot=self.bot,
+            )
+            return
+
+        if is_external_control_text(raw_text):
+            await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
             return
 
         await self.platform_router.send_text(user, "Напишите: Отправить, Заново или Отмена.", telegram_bot=self.bot)
@@ -177,12 +402,39 @@ class ExternalSupportProcessor:
 
         question = draft.form.questions[draft.question_index]
         text = (incoming.text or "").strip()
-        if question.allow_multiple and question.answer_type in {ANSWER_TYPE_MEDIA, ANSWER_TYPE_ANY}:
+        normalized_text = text.casefold()
+        if normalized_text in {"пропустить", "skip"}:
+            if question.required:
+                await self.platform_router.send_question(
+                    user,
+                    draft.form,
+                    draft.question_index,
+                    prefix_text="Это обязательный вопрос.",
+                    telegram_bot=self.bot,
+                )
+                return
+            draft.answers.append(build_skipped_answer(question))
+            await self.advance_or_summary(user, draft)
+            return
+        if normalized_text in {"отправить", "send", "submit", "да", "заново", "restart"}:
+            await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
+            return
+        if normalized_text in {"продолжить", "continue", "далее"} and not question_accepts_multiple_media(question):
+            await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
+            return
+
+        if question_accepts_multiple_media(question):
             answer = find_answer(draft.answers, question.id)
-            if text.casefold() in {"продолжить", "continue", "далее"}:
+            if normalized_text in {"продолжить", "continue", "далее"}:
                 media_count = len(TicketService.extract_media_files(answer or {}))
                 if media_count == 0 and question.required:
-                    await self.platform_router.send_text(user, f"Пожалуйста, прикрепите файл.\n\n{build_question_text(question)}", telegram_bot=self.bot)
+                    await self.platform_router.send_question(
+                        user,
+                        draft.form,
+                        draft.question_index,
+                        prefix_text="Пожалуйста, прикрепите файл.",
+                        telegram_bot=self.bot,
+                    )
                     return
                 if media_count == 0:
                     draft.answers.append(build_skipped_answer(question))
@@ -192,19 +444,39 @@ class ExternalSupportProcessor:
             if incoming.attachments:
                 draft.answers = append_external_media(draft.answers, question, incoming.attachments)
                 media_count = len(TicketService.extract_media_files(find_answer(draft.answers, question.id) or {}))
-                if media_count >= question.max_files:
-                    await self.advance_or_summary(user, draft)
-                else:
-                    await self.platform_router.send_text(
-                        user,
-                        f"Файлы добавлены: {media_count} из {question.max_files}.\nМожно отправить ещё файл или написать «Продолжить».",
-                        telegram_bot=self.bot,
-                    )
+                max_files = question.max_files
+                limit_reached = max_files is not None and media_count >= max_files
+                await self.platform_router.send_media_continue(
+                    user,
+                    draft.question_index,
+                    media_count,
+                    max_files,
+                    limit_reached=limit_reached,
+                    telegram_bot=self.bot,
+                )
+                return
+
+            if len(TicketService.extract_media_files(answer or {})) > 0:
+                await self.platform_router.send_media_continue(
+                    user,
+                    draft.question_index,
+                    len(TicketService.extract_media_files(answer or {})),
+                    question.max_files,
+                    limit_reached=question.max_files is not None
+                    and len(TicketService.extract_media_files(answer or {})) >= question.max_files,
+                    telegram_bot=self.bot,
+                )
                 return
 
         answer, error = validate_external_answer(question, incoming)
         if error:
-            await self.platform_router.send_text(user, f"{error}\n\n{build_question_text(question)}", telegram_bot=self.bot)
+            await self.platform_router.send_question(
+                user,
+                draft.form,
+                draft.question_index,
+                prefix_text=error,
+                telegram_bot=self.bot,
+            )
             return
 
         draft.answers.append(answer)
@@ -213,16 +485,15 @@ class ExternalSupportProcessor:
     async def advance_or_summary(self, user: User, draft: ExternalDraft) -> None:
         draft.question_index += 1
         if draft.question_index < len(draft.form.questions):
-            await self.platform_router.send_text(user, build_question_text(draft.form.questions[draft.question_index]), telegram_bot=self.bot)
+            await self.platform_router.send_question(user, draft.form, draft.question_index, telegram_bot=self.bot)
             return
         await self.show_summary(user, draft)
 
     async def show_summary(self, user: User, draft: ExternalDraft) -> None:
         draft.confirming = True
-        summary = TicketService.build_user_summary_text(draft.form, draft.answers)
-        await self.platform_router.send_text(user, f"{summary}\n\nНапишите: Отправить, Заново или Отмена.", telegram_bot=self.bot)
+        await self.platform_router.send_ticket_preview(user, draft.form, draft.answers, telegram_bot=self.bot)
 
-    async def submit_ticket(self, session: AsyncSession, user: User, draft: ExternalDraft) -> None:
+    async def submit_ticket(self, session: AsyncSession, user: User, draft: ExternalDraft) -> Ticket:
         ticket_service = TicketService(session, self.settings.support_chat_id)
         topic_service = TopicService(UserService(session), self.settings.support_chat_id)
         message_service = MessageService(session, self.settings.support_chat_id)
@@ -239,6 +510,7 @@ class ExternalSupportProcessor:
             form=draft.form,
             answers=draft.answers,
         )
+        return ticket
 
     def resolve_form(self, text: str) -> TicketForm | None:
         if not self.ticket_form_service.enabled:
@@ -422,9 +694,9 @@ def append_external_media(answers: list[dict[str, Any]], question: TicketQuestio
         answers.append(answer)
     media_files = answer.setdefault("media_files", [])
     current_count = len(media_files)
-    limit = max(1, question.max_files)
+    limit = question.max_files
     for index, attachment in enumerate(attachments, start=current_count):
-        if len(media_files) >= limit:
+        if limit is not None and len(media_files) >= limit:
             break
         media_files.append(attachment_to_media_item(attachment, index))
     if media_files:
@@ -462,6 +734,28 @@ def build_skipped_answer(question: TicketQuestion) -> dict[str, Any]:
 
 def find_answer(answers: list[dict[str, Any]], question_id: str) -> dict[str, Any] | None:
     return next((answer for answer in answers if answer.get("question_id") == question_id), None)
+
+
+def question_accepts_multiple_media(question: TicketQuestion) -> bool:
+    return question.allow_multiple and question.answer_type in {ANSWER_TYPE_MEDIA, ANSWER_TYPE_ANY}
+
+
+def is_external_control_text(text: str) -> bool:
+    return (text or "").strip().casefold() in {
+        "отправить",
+        "send",
+        "submit",
+        "да",
+        "заново",
+        "restart",
+        "отмена",
+        "cancel",
+        "продолжить",
+        "continue",
+        "далее",
+        "пропустить",
+        "skip",
+    }
 
 
 def build_question_text(question: TicketQuestion) -> str:

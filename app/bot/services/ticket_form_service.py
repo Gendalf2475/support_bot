@@ -24,7 +24,7 @@ class TicketQuestion:
     answer_type: str = ANSWER_TYPE_ANY
     help_text: str | None = None
     allow_multiple: bool = False
-    max_files: int = 1
+    max_files: int | None = 1
 
 
 @dataclass(frozen=True)
@@ -199,11 +199,13 @@ class TicketFormService:
         return questions
 
     @staticmethod
-    def _parse_max_files(raw_value: Any, allow_multiple: bool) -> int:
+    def _parse_max_files(raw_value: Any, allow_multiple: bool) -> int | None:
         if not allow_multiple:
             return 1
+        if raw_value is None or str(raw_value).strip() == "":
+            return None
         try:
-            max_files = int(raw_value or 5)
+            max_files = int(raw_value)
         except (TypeError, ValueError):
             max_files = 5
         return max(1, min(max_files, 20))

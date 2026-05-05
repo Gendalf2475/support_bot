@@ -232,8 +232,13 @@ async def handle_form_answer(
         and not (raw_answer and raw_answer.get("file_id"))
     ):
         media_count = get_current_media_count(list(data.get("answers", [])), question)
+        max_files = question.max_files
         await message.answer(
-            build_multiple_media_confirmation_text(media_count, question.max_files, media_count >= question.max_files),
+            build_multiple_media_confirmation_text(
+                media_count,
+                max_files,
+                max_files is not None and media_count >= max_files,
+            ),
             reply_markup=multiple_media_keyboard(question_index),
         )
         return
@@ -1045,7 +1050,7 @@ async def process_multiple_media_items(
 
     answers = list(data.get("answers", []))
     current_count = get_current_media_count(answers, question)
-    max_files = question.max_files if question.max_files > 0 else None
+    max_files = question.max_files if question.max_files is not None and question.max_files > 0 else None
     if max_files is not None and current_count >= max_files:
         await message.answer(
             build_multiple_media_limit_text(max_files),

@@ -64,6 +64,119 @@ class PlatformRouter:
             logger.exception("Failed to send platform message platform=%s user_id=%s: %s", user.platform, user.id, error)
             return None
 
+    async def send_form_menu(
+        self,
+        user: User,
+        forms: list[TicketForm],
+        *,
+        text: str | None = None,
+        telegram_bot: Bot | None = None,
+    ) -> SentMessageRef | None:
+        if user.platform == Platform.TELEGRAM.value:
+            from app.bot.keyboards import ticket_forms_reply_keyboard
+
+            reply_markup = ticket_forms_reply_keyboard(forms) if forms else None
+            return await self.send_text(user, text or build_external_start_text(), telegram_bot=telegram_bot, telegram_reply_markup=reply_markup)
+
+        adapter = self.adapters.get(user.platform)
+        sender = getattr(adapter, "send_form_menu", None) if adapter is not None else None
+        if callable(sender):
+            try:
+                sent = await sender(user, forms, text)
+                if sent is not None:
+                    return sent
+            except Exception as error:
+                logger.exception("Failed to send platform form menu platform=%s user_id=%s: %s", user.platform, user.id, error)
+
+        fallback_text = build_external_start_text()
+        if text:
+            fallback_text = f"{text.strip()}\n\n{fallback_text}"
+        if forms:
+            fallback_text = f"{fallback_text}\n\n{build_external_forms_text(forms)}"
+        return await self.send_text(user, fallback_text, telegram_bot=telegram_bot)
+
+    async def send_question(
+        self,
+        user: User,
+        form: TicketForm,
+        question_index: int,
+        *,
+        prefix_text: str | None = None,
+        telegram_bot: Bot | None = None,
+    ) -> SentMessageRef | None:
+        adapter = self.adapters.get(user.platform)
+        sender = getattr(adapter, "send_question", None) if adapter is not None else None
+        if callable(sender):
+            try:
+                sent = await sender(user, form, question_index, prefix_text)
+                if sent is not None:
+                    return sent
+            except Exception as error:
+                logger.exception("Failed to send platform question platform=%s user_id=%s: %s", user.platform, user.id, error)
+        return await self.send_text(user, build_external_question_text(form, question_index, prefix_text), telegram_bot=telegram_bot)
+
+    async def send_media_continue(
+        self,
+        user: User,
+        question_index: int,
+        media_count: int,
+        max_files: int | None,
+        *,
+        limit_reached: bool = False,
+        telegram_bot: Bot | None = None,
+    ) -> SentMessageRef | None:
+        adapter = self.adapters.get(user.platform)
+        sender = getattr(adapter, "send_media_continue", None) if adapter is not None else None
+        if callable(sender):
+            try:
+                sent = await sender(user, question_index, media_count, max_files, limit_reached=limit_reached)
+                if sent is not None:
+                    return sent
+            except Exception as error:
+                logger.exception("Failed to send platform media controls platform=%s user_id=%s: %s", user.platform, user.id, error)
+        return await self.send_text(user, build_external_media_continue_text(media_count, max_files, limit_reached), telegram_bot=telegram_bot)
+
+    async def send_ticket_preview(
+        self,
+        user: User,
+        form: TicketForm,
+        answers: list[dict[str, Any]],
+        *,
+        telegram_bot: Bot | None = None,
+    ) -> SentMessageRef | None:
+        adapter = self.adapters.get(user.platform)
+        sender = getattr(adapter, "send_ticket_preview", None) if adapter is not None else None
+        if callable(sender):
+            try:
+                sent = await sender(user, form, answers)
+                if sent is not None:
+                    return sent
+            except Exception as error:
+                logger.exception("Failed to send platform ticket preview platform=%s user_id=%s: %s", user.platform, user.id, error)
+        text = f"{build_external_preview_text(form, answers)}\n\nНапишите: Отправить, Заново или Отмена."
+        return await self.send_text(user, text, telegram_bot=telegram_bot)
+
+    async def send_ticket_sent(
+        self,
+        user: User,
+        ticket_id: int | None = None,
+        *,
+        telegram_bot: Bot | None = None,
+    ) -> SentMessageRef | None:
+        adapter = self.adapters.get(user.platform)
+        sender = getattr(adapter, "send_ticket_sent", None) if adapter is not None else None
+        if callable(sender):
+            try:
+                sent = await sender(user, ticket_id)
+                if sent is not None:
+                    return sent
+            except Exception as error:
+                logger.exception("Failed to send platform ticket sent notice platform=%s user_id=%s: %s", user.platform, user.id, error)
+        text = "✅ Тикет отправлен в поддержку. Ответ придёт сюда."
+        if ticket_id is not None:
+            text = f"{text}\nТикет: #{ticket_id}"
+        return await self.send_text(user, text, telegram_bot=telegram_bot)
+
     async def send_support_message(
         self,
         session: AsyncSession,
@@ -128,12 +241,93 @@ class PlatformRouter:
             reply_markup = ticket_forms_reply_keyboard(ticket_forms) if ticket_forms else None
             return await self.send_text(user, text, telegram_bot=telegram_bot, telegram_reply_markup=reply_markup)
 
+        adapter = self.adapters.get(user.platform)
+        sender = getattr(adapter, "send_closed_ticket_menu", None) if adapter is not None else None
+        if ticket_forms and callable(sender):
+            try:
+                sent = await sender(user, text, ticket_forms)
+                if sent is not None:
+                    return sent
+            except Exception as error:
+                logger.exception("Failed to send platform ticket closed menu platform=%s user_id=%s: %s", user.platform, user.id, error)
+
         if ticket_forms:
             text = f"{text}\n\n{build_external_forms_text(ticket_forms)}"
         return await self.send_text(user, text)
+
+
+def build_external_start_text() -> str:
+    return (
+        "Здравствуйте! Здесь вы можете обратиться в поддержку.\n\n"
+        "Выберите тип обращения ниже."
+    )
 
 
 def build_external_forms_text(forms: list[TicketForm]) -> str:
     lines = ["Выберите тип обращения, отправив номер или название:"]
     lines.extend(f"{index}. {form.title}" for index, form in enumerate(forms, start=1))
     return "\n".join(lines)
+
+
+def build_external_question_text(form: TicketForm, question_index: int, prefix_text: str | None = None) -> str:
+    question = form.questions[question_index]
+    lines = [
+        form.title,
+        "",
+        f"Вопрос {question_index + 1} из {len(form.questions)}",
+        "",
+        question.text,
+    ]
+    if question.help_text:
+        lines.extend(["", f"Подсказка: {question.help_text}"])
+    if prefix_text:
+        lines = [prefix_text.strip(), ""] + lines
+    return "\n".join(lines)
+
+
+def build_external_media_continue_text(media_count: int, max_files: int | None, limit_reached: bool = False) -> str:
+    if max_files is None:
+        return (
+            f"Файлы добавлены: {media_count}.\n"
+            "Можно отправить ещё файл или написать «Продолжить»."
+        )
+    if limit_reached:
+        return (
+            f"Файлы добавлены: {media_count} из {max_files}.\n"
+            "Достигнут лимит файлов.\n\n"
+            "Напишите «Продолжить», чтобы перейти дальше."
+        )
+    return (
+        f"Файлы добавлены: {media_count} из {max_files}.\n"
+        "Можно отправить ещё файл или написать «Продолжить»."
+    )
+
+
+def build_external_preview_text(form: TicketForm, answers: list[dict[str, Any]]) -> str:
+    lines = [
+        "Проверьте данные тикета:",
+        "",
+        f"Тип обращения: {form.title}",
+        "",
+    ]
+    answers_by_question = {answer.get("question_id"): answer for answer in answers}
+    for question in form.questions:
+        answer = answers_by_question.get(question.id)
+        lines.append(f"{question.text.strip().rstrip(':')}:")
+        lines.append(format_external_preview_answer(answer))
+        lines.append("")
+    lines.append("Отправить тикет?")
+    return "\n".join(lines)
+
+
+def format_external_preview_answer(answer: dict[str, Any] | None) -> str:
+    if answer is None or answer.get("skipped"):
+        return "— Пропущено"
+    if answer.get("answer_type") == "media":
+        media_files = answer.get("media_files")
+        if isinstance(media_files, list):
+            media_count = len([media for media in media_files if isinstance(media, dict) and media.get("file_id")])
+        else:
+            media_count = 1 if answer.get("file_id") else 0
+        return f"📎 Медиафайлов: {media_count}" if media_count else "— Пропущено"
+    return str(answer.get("answer_text") or "не указано")

@@ -6,7 +6,7 @@ import random
 import threading
 from typing import Any
 
-from app.bot.channels.base import ATTACHMENT_DOCUMENT, ATTACHMENT_PHOTO, Attachment, IncomingMessage, OutgoingMessage, SentMessageRef
+from app.bot.channels.base import ATTACHMENT_DOCUMENT, ATTACHMENT_PHOTO, ATTACHMENT_VIDEO, Attachment, IncomingMessage, OutgoingMessage, SentMessageRef
 from app.bot.config import Settings
 from app.bot.database.models import Platform
 from app.bot.services.external_support import ExternalSupportProcessor
@@ -61,19 +61,96 @@ class VKChannel:
         self._stopped.set()
 
     async def send_message(self, message: OutgoingMessage) -> SentMessageRef | None:
+        return await self._send_vk_message(message.platform_user_id, message.text or "")
+
+    async def send_form_menu(self, user: Any, forms: list[Any], text: str | None = None) -> SentMessageRef | None:
+        from app.bot.channels import vk_ui
+
+        return await self._send_vk_message(
+            user.platform_user_id,
+            vk_ui.build_form_menu_text(text),
+            keyboard=vk_ui.build_form_keyboard(forms),
+        )
+
+    async def send_question(
+        self,
+        user: Any,
+        form: Any,
+        question_index: int,
+        prefix_text: str | None = None,
+    ) -> SentMessageRef | None:
+        from app.bot.channels import vk_ui
+
+        question = form.questions[question_index]
+        return await self._send_vk_message(
+            user.platform_user_id,
+            vk_ui.build_question_text(form, question_index, prefix_text=prefix_text),
+            keyboard=vk_ui.build_question_keyboard(question),
+        )
+
+    async def send_media_continue(
+        self,
+        user: Any,
+        question_index: int,
+        media_count: int,
+        max_files: int | None,
+        *,
+        limit_reached: bool = False,
+    ) -> SentMessageRef | None:
+        from app.bot.channels import vk_ui
+
+        return await self._send_vk_message(
+            user.platform_user_id,
+            vk_ui.build_media_continue_text(media_count, max_files, limit_reached=limit_reached),
+            keyboard=vk_ui.build_media_continue_keyboard(),
+        )
+
+    async def send_ticket_preview(self, user: Any, form: Any, answers: list[dict[str, Any]]) -> SentMessageRef | None:
+        from app.bot.channels import vk_ui
+
+        return await self._send_vk_message(
+            user.platform_user_id,
+            vk_ui.build_preview_text(form, answers),
+            keyboard=vk_ui.build_preview_keyboard(),
+        )
+
+    async def send_ticket_sent(self, user: Any, ticket_id: int | None = None) -> SentMessageRef | None:
+        from app.bot.channels import vk_ui
+
+        return await self._send_vk_message(user.platform_user_id, vk_ui.build_ticket_sent_text(ticket_id))
+
+    async def send_closed_ticket_menu(self, user: Any, text: str, forms: list[Any]) -> SentMessageRef | None:
+        from app.bot.channels import vk_ui
+
+        return await self._send_vk_message(
+            user.platform_user_id,
+            text,
+            keyboard=vk_ui.build_closed_ticket_keyboard(forms),
+        )
+
+    async def _send_vk_message(
+        self,
+        platform_user_id: str,
+        text: str,
+        *,
+        keyboard: str | None = None,
+    ) -> SentMessageRef | None:
         if self.vk_session is None:
             logger.error("VK session is not started")
             return None
         try:
             vk = self.vk_session.get_api()
-            response = vk.messages.send(
-                user_id=int(message.platform_user_id),
-                message=message.text or "",
-                random_id=random.randint(1, 2_147_483_647),
-            )
+            payload: dict[str, Any] = {
+                "user_id": int(platform_user_id),
+                "message": text or "",
+                "random_id": random.randint(1, 2_147_483_647),
+            }
+            if keyboard is not None:
+                payload["keyboard"] = keyboard
+            response = vk.messages.send(**payload)
             return SentMessageRef(platform_message_id=str(response))
         except Exception as error:
-            logger.exception("Failed to send VK message user_id=%s: %s", message.platform_user_id, error)
+            logger.exception("Failed to send VK message user_id=%s: %s", platform_user_id, error)
             return None
 
     @staticmethod
@@ -104,5 +181,19 @@ class VKChannel:
                 file_url=data.get("url"),
                 filename=data.get("title"),
                 size=data.get("size"),
+            )
+        if attachment_type == "video":
+            owner_id = data.get("owner_id")
+            video_id = data.get("id")
+            access_key = data.get("access_key")
+            file_url = None
+            if owner_id is not None and video_id is not None:
+                file_url = f"https://vk.com/video{owner_id}_{video_id}"
+                if access_key:
+                    file_url = f"{file_url}_{access_key}"
+            return Attachment(
+                type=ATTACHMENT_VIDEO,
+                file_url=file_url,
+                filename=data.get("title"),
             )
         return None
