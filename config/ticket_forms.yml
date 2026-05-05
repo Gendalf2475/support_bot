@@ -6,6 +6,31 @@ forms:
     description: "Форма для восстановления доступа к аккаунту"
     button_text: "🔐 Забыл пароль"
     admin_title: "Заявка на восстановление пароля"
+    success_text: |
+      Заявка на восстановление пароля отправлена.
+      Обычно проверка занимает до 24 часов.
+    close_reasons:
+      - id: "restored"
+        title: "Доступ восстановлен"
+        button_text: "✅ Доступ восстановлен"
+        user_message: |
+          Ваше обращение закрыто.
+          Доступ к аккаунту восстановлен.
+        show_to_user: true
+
+      - id: "not_enough_data"
+        title: "Недостаточно данных"
+        button_text: "📎 Недостаточно данных"
+        user_message: |
+          Обращение закрыто: недостаточно данных для восстановления доступа.
+        show_to_user: true
+
+      - id: "not_owner"
+        title: "Владение не подтверждено"
+        button_text: "⛔ Владение не подтверждено"
+        user_message: |
+          Обращение закрыто: не удалось подтвердить владение аккаунтом.
+        show_to_user: true
     questions:
       - id: "nickname"
         text: "Введите ваш игровой ник:"
@@ -32,6 +57,32 @@ forms:
     description: "Форма для жалобы на нарушителя"
     button_text: "🚨 Жалоба на игрока"
     admin_title: "Жалоба на игрока"
+    success_text: |
+      Ваша жалоба отправлена.
+      Обычно проверка занимает до 24 часов.
+    close_reasons:
+      - id: "punished"
+        title: "Нарушитель наказан"
+        button_text: "✅ Нарушитель наказан"
+        user_message: |
+          Ваша жалоба рассмотрена.
+          Нарушитель наказан.
+        show_to_user: true
+
+      - id: "not_enough_proof"
+        title: "Недостаточно доказательств"
+        button_text: "📎 Недостаточно доказательств"
+        user_message: |
+          Ваша жалоба закрыта, так как доказательств недостаточно.
+          В следующий раз приложите скриншоты, видео или другие подтверждения.
+        show_to_user: true
+
+      - id: "duplicate"
+        title: "Дубликат"
+        button_text: "🔁 Дубликат"
+        user_message: |
+          Этот тикет закрыт как дубликат.
+        show_to_user: true
     questions:
       - id: "your_nickname"
         text: "Введите ваш игровой ник:"
@@ -64,6 +115,23 @@ forms:
     description: "Свободное обращение в поддержку"
     button_text: "💬 Другое"
     admin_title: "Другое обращение"
+    success_text: |
+      Ваше обращение отправлено.
+      Ответ придёт сюда.
+    close_reasons:
+      - id: "resolved"
+        title: "Решено"
+        button_text: "✅ Решено"
+        user_message: |
+          Ваше обращение закрыто: вопрос решён.
+        show_to_user: true
+
+      - id: "no_user_response"
+        title: "Нет ответа от пользователя"
+        button_text: "👤 Нет ответа"
+        user_message: |
+          Ваше обращение закрыто, так как от вас не поступил ответ.
+        show_to_user: true
     questions:
       - id: "your_nickname"
         text: "Введите ваш игровой ник:"

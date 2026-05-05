@@ -32,6 +32,13 @@ class Settings(BaseSettings):
     ticket_check_interval_minutes: int = Field(10, alias="TICKET_CHECK_INTERVAL_MINUTES")
     ticket_auto_close_enabled: bool = Field(True, alias="TICKET_AUTO_CLOSE_ENABLED")
     ticket_auto_close_after_days: int = Field(7, alias="TICKET_AUTO_CLOSE_AFTER_DAYS")
+    user_reply_reminder_enabled: bool = Field(True, alias="USER_REPLY_REMINDER_ENABLED")
+    user_reply_reminder_after_hours: int = Field(24, alias="USER_REPLY_REMINDER_AFTER_HOURS")
+    user_reply_reminder_interval_hours: int = Field(24, alias="USER_REPLY_REMINDER_INTERVAL_HOURS")
+    ticket_auto_close_warning_enabled: bool = Field(True, alias="TICKET_AUTO_CLOSE_WARNING_ENABLED")
+    ticket_auto_close_warning_hours: int = Field(24, alias="TICKET_AUTO_CLOSE_WARNING_HOURS")
+    channel_failure_notify_enabled: bool = Field(True, alias="CHANNEL_FAILURE_NOTIFY_ENABLED")
+    channel_failure_notify_cooldown_minutes: int = Field(30, alias="CHANNEL_FAILURE_NOTIFY_COOLDOWN_MINUTES")
 
     model_config = SettingsConfigDict(
         env_file=PROJECT_ROOT / ".env",

@@ -18,7 +18,6 @@ from app.bot.keyboards import (
     close_reason_keyboard,
     closed_ticket_keyboard,
     SUPPORT_CLOSE_TICKET_TEXT,
-    support_close_reason_keyboard,
 )
 from app.bot.services.ticket_form_service import TicketFormService
 from app.bot.services.ticket_service import CLOSE_REASONS, MANUAL_CLOSE_REASON_CODES, TicketService
@@ -106,7 +105,13 @@ async def user_status(message: Message, bot: Bot, session: AsyncSession, setting
 
 
 @router.message(Command("close"))
-async def close_ticket_by_command(message: Message, bot: Bot, session: AsyncSession, settings: Settings) -> None:
+async def close_ticket_by_command(
+    message: Message,
+    bot: Bot,
+    session: AsyncSession,
+    settings: Settings,
+    ticket_form_service: TicketFormService,
+) -> None:
     if message.chat.id != settings.support_chat_id:
         return
     if message.message_thread_id is None:
@@ -122,11 +127,17 @@ async def close_ticket_by_command(message: Message, bot: Bot, session: AsyncSess
         await message.answer("В этом топике нет открытого тикета.")
         return
 
-    await prompt_close_reason(message, ticket)
+    await prompt_close_reason(message, ticket, ticket_form_service)
 
 
 @router.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}), F.text == SUPPORT_CLOSE_TICKET_TEXT)
-async def close_ticket_by_keyboard(message: Message, bot: Bot, session: AsyncSession, settings: Settings) -> None:
+async def close_ticket_by_keyboard(
+    message: Message,
+    bot: Bot,
+    session: AsyncSession,
+    settings: Settings,
+    ticket_form_service: TicketFormService,
+) -> None:
     if message.chat.id != settings.support_chat_id:
         return
     if message.message_thread_id is None:
@@ -144,7 +155,7 @@ async def close_ticket_by_keyboard(message: Message, bot: Bot, session: AsyncSes
         await message.answer("Нет открытого тикета для закрытия.", reply_markup=ReplyKeyboardRemove())
         return
 
-    await prompt_close_reason(message, ticket)
+    await prompt_close_reason(message, ticket, ticket_form_service)
 
 
 @router.message(
@@ -181,15 +192,19 @@ async def close_ticket_by_reason_keyboard(
         await message.answer("Нет открытого тикета для закрытия.", reply_markup=ReplyKeyboardRemove())
         return
 
-    closed = await close_ticket(
-        bot=bot,
-        ticket_service=ticket_service,
-        ticket=ticket,
-        closed_by_telegram_id=message.from_user.id,
-        reason=reason,
-        ticket_form_service=ticket_form_service,
-        platform_router=platform_router,
-    )
+    try:
+        closed = await close_ticket(
+            bot=bot,
+            ticket_service=ticket_service,
+            ticket=ticket,
+            closed_by_telegram_id=message.from_user.id,
+            reason=reason,
+            ticket_form_service=ticket_form_service,
+            platform_router=platform_router,
+        )
+    except ValueError:
+        await message.answer("Причина закрытия устарела. Нажмите «Закрыть тикет» ещё раз.")
+        return
     if not closed:
         await message.answer("Тикет уже закрыт.")
 
@@ -200,6 +215,7 @@ async def close_ticket_by_callback(
     bot: Bot,
     session: AsyncSession,
     settings: Settings,
+    ticket_form_service: TicketFormService,
 ) -> None:
     message = callback.message
     if not isinstance(message, Message):
@@ -228,11 +244,15 @@ async def close_ticket_by_callback(
         return
 
     assert ticket is not None
+    reasons = TicketService.get_form_close_reasons(
+        ticket,
+        ticket_form_service.get_forms() if ticket_form_service.enabled else None,
+    )
     try:
         await bot.edit_message_reply_markup(
             chat_id=settings.support_chat_id,
             message_id=message.message_id,
-            reply_markup=close_reason_keyboard(ticket.id),
+            reply_markup=close_reason_keyboard(ticket.id, reasons),
         )
     except TelegramAPIError as error:
         logger.error("Failed to show close reasons ticket_id=%s message_id=%s: %s", ticket.id, message.message_id, error)
@@ -240,7 +260,7 @@ async def close_ticket_by_callback(
             chat_id=settings.support_chat_id,
             message_thread_id=message.message_thread_id,
             text="Выберите причину закрытия тикета:",
-            reply_markup=close_reason_keyboard(ticket.id),
+            reply_markup=close_reason_keyboard(ticket.id, reasons),
         )
 
     await callback.answer("Выберите причину закрытия.")
@@ -283,7 +303,11 @@ async def close_ticket_with_reason(
         return
 
     assert ticket is not None
-    closed = await close_ticket(bot, ticket_service, ticket, callback.from_user.id, reason, ticket_form_service, platform_router)
+    try:
+        closed = await close_ticket(bot, ticket_service, ticket, callback.from_user.id, reason, ticket_form_service, platform_router)
+    except ValueError:
+        await callback.answer("Причина закрытия устарела. Откройте список причин заново.", show_alert=True)
+        return
     if not closed:
         await callback.answer("Тикет уже закрыт.", show_alert=True)
         return
@@ -339,10 +363,16 @@ async def close_ticket(
     )
 
 
-async def prompt_close_reason(message: Message, ticket: Ticket) -> None:
+async def prompt_close_reason(
+    message: Message,
+    ticket: Ticket,
+    ticket_form_service: TicketFormService | None = None,
+) -> None:
+    ticket_forms = ticket_form_service.get_forms() if ticket_form_service and ticket_form_service.enabled else None
+    reasons = TicketService.get_form_close_reasons(ticket, ticket_forms)
     await message.answer(
         f"Выберите причину закрытия тикета #{ticket.id}:",
-        reply_markup=support_close_reason_keyboard(),
+        reply_markup=close_reason_keyboard(ticket.id, reasons),
     )
 
 
@@ -382,7 +412,7 @@ def parse_close_reason_callback(callback_data: str | None) -> tuple[int, str] | 
 
     raw_payload = callback_data.removeprefix(CALLBACK_CLOSE_REASON_PREFIX)
     raw_ticket_id, separator, reason = raw_payload.partition(":")
-    if not separator or reason not in MANUAL_CLOSE_REASON_CODES:
+    if not separator or not reason:
         return None
 
     try:
@@ -400,7 +430,9 @@ def validate_ticket_for_callback(ticket: Ticket | None, topic_id: int) -> str | 
         return "Тикет не относится к этому топику."
     if ticket.status == TicketStatus.CLOSED:
         return "Тикет уже закрыт."
-    if ticket.status != TicketStatus.OPEN:
+    if ticket.status == TicketStatus.CANCELLED:
+        return "Тикет отменён."
+    if ticket.status not in {TicketStatus.OPEN, TicketStatus.IN_PROGRESS, TicketStatus.WAITING_USER}:
         return "Тикет не открыт."
     return None
 

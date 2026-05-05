@@ -283,9 +283,9 @@ def build_ticket_preview_embed(form: TicketForm, answers: list[dict[str, Any]]) 
     return embed
 
 
-def build_ticket_sent_embed(ticket_id: int | None = None) -> discord.Embed:
-    description = "Ваш тикет отправлен в поддержку.\nОтвет придёт сюда."
-    if ticket_id is not None:
+def build_ticket_sent_embed(ticket_id: int | None = None, success_text: str | None = None) -> discord.Embed:
+    description = success_text or "Ваш тикет отправлен в поддержку.\nОтвет придёт сюда."
+    if ticket_id is not None and success_text is None:
         description = f"{description}\n\nТикет: #{ticket_id}"
     return discord.Embed(
         title="✅ Тикет отправлен",

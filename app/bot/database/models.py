@@ -29,6 +29,8 @@ class Platform(StrEnum):
 
 class TicketStatus(StrEnum):
     OPEN = "open"
+    IN_PROGRESS = "in_progress"
+    WAITING_USER = "waiting_user"
     CLOSED = "closed"
     CANCELLED = "cancelled"
 
@@ -87,7 +89,10 @@ class Ticket(Base):
     control_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     close_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
     last_user_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_support_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_reminded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_user_reply_reminded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    auto_close_warning_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

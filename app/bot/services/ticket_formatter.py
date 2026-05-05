@@ -223,7 +223,14 @@ class TicketFormatter:
         close_reason_label: str | None,
         closed_at: datetime | None,
     ) -> str:
-        status_text = "✅ Закрыт" if status == TicketStatus.CLOSED else "🟢 Открыт"
+        status_texts = {
+            TicketStatus.OPEN: "🟢 Открыт",
+            TicketStatus.IN_PROGRESS: "🟣 В работе",
+            TicketStatus.WAITING_USER: "⏳ Ожидает пользователя",
+            TicketStatus.CLOSED: "✅ Закрыт",
+            TicketStatus.CANCELLED: "🚫 Отменён",
+        }
+        status_text = status_texts.get(status, str(status.value if hasattr(status, "value") else status))
         lines = [
             "Статус:",
             status_text,

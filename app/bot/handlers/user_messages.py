@@ -61,7 +61,6 @@ OPEN_TICKET_EXISTS_TEXT = (
 BLOCKED_TEXT = "Вы заблокированы службой поддержки."
 NO_OPEN_TICKET_TEXT = "Чтобы обратиться в поддержку, откройте тикет."
 CANCELLED_TEXT = "Заполнение тикета отменено."
-TICKET_SENT_TEXT = "✅ Тикет отправлен в поддержку.\nОтвет придёт в этот чат."
 FORMS_DISABLED_TEXT = "Система форм тикетов сейчас отключена. Попробуйте позже."
 DELIVERY_ERROR_TEXT = (
     "Сейчас не удалось передать обращение в поддержку. "
@@ -544,7 +543,11 @@ async def submit_ticket(
         return
 
     await state.clear()
-    await message.answer(TICKET_SENT_TEXT, reply_markup=ReplyKeyboardRemove())
+    assert ticket is not None
+    await message.answer(
+        TicketService.build_success_text(form, ticket, user),
+        reply_markup=ReplyKeyboardRemove(),
+    )
     await callback.answer()
 
 

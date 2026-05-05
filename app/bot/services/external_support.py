@@ -227,7 +227,12 @@ class ExternalSupportProcessor:
                     return
                 ticket = await self.submit_ticket(session, user, draft)
                 self.drafts.pop(key, None)
-                await self.platform_router.send_ticket_sent(user, ticket.id, telegram_bot=self.bot)
+                await self.platform_router.send_ticket_sent(
+                    user,
+                    ticket.id,
+                    success_text=TicketService.build_success_text(draft.form, ticket, user),
+                    telegram_bot=self.bot,
+                )
                 await session.commit()
                 return
 
@@ -364,7 +369,12 @@ class ExternalSupportProcessor:
         if text in {"отправить", "send", "submit", "да"}:
             ticket = await self.submit_ticket(session, user, draft)
             self.drafts.pop(key, None)
-            await self.platform_router.send_ticket_sent(user, ticket.id, telegram_bot=self.bot)
+            await self.platform_router.send_ticket_sent(
+                user,
+                ticket.id,
+                success_text=TicketService.build_success_text(draft.form, ticket, user),
+                telegram_bot=self.bot,
+            )
             return
 
         if text in {"заново", "restart"}:

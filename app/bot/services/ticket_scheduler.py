@@ -32,7 +32,7 @@ class TicketMaintenanceScheduler:
         self.scheduler = AsyncIOScheduler(timezone="UTC")
 
     def start(self) -> None:
-        if not self.settings.ticket_reminder_enabled and not self.settings.ticket_auto_close_enabled:
+        if not self.has_enabled_jobs():
             logger.info("Ticket maintenance scheduler is disabled")
             return
 
@@ -59,14 +59,15 @@ class TicketMaintenanceScheduler:
             async with self.sessionmaker() as session:
                 ticket_service = TicketService(session, self.settings.support_chat_id)
 
-                if self.settings.ticket_reminder_enabled:
-                    reminders_sent = await ticket_service.send_due_reminders(
+                if self.settings.ticket_auto_close_enabled and self.settings.ticket_auto_close_warning_enabled:
+                    warnings_sent = await ticket_service.send_auto_close_warnings(
                         bot=self.bot,
-                        reminder_after_hours=self.settings.ticket_reminder_after_hours,
-                        reminder_interval_minutes=self.settings.ticket_reminder_interval_minutes,
+                        auto_close_after_days=self.settings.ticket_auto_close_after_days,
+                        warning_hours=self.settings.ticket_auto_close_warning_hours,
+                        platform_router=self.platform_router,
                     )
-                    if reminders_sent:
-                        logger.info("Ticket reminders sent count=%s", reminders_sent)
+                    if warnings_sent:
+                        logger.info("Auto-close warnings sent count=%s", warnings_sent)
 
                 if self.settings.ticket_auto_close_enabled:
                     tickets_closed = await ticket_service.auto_close_inactive_tickets(
@@ -78,6 +79,34 @@ class TicketMaintenanceScheduler:
                     if tickets_closed:
                         logger.info("Inactive tickets auto-closed count=%s", tickets_closed)
 
+                if self.settings.user_reply_reminder_enabled:
+                    user_reminders_sent = await ticket_service.send_waiting_user_reminders(
+                        bot=self.bot,
+                        reminder_after_hours=self.settings.user_reply_reminder_after_hours,
+                        reminder_interval_hours=self.settings.user_reply_reminder_interval_hours,
+                        platform_router=self.platform_router,
+                    )
+                    if user_reminders_sent:
+                        logger.info("Waiting-user reminders sent count=%s", user_reminders_sent)
+
+                if self.settings.ticket_reminder_enabled:
+                    reminders_sent = await ticket_service.send_due_reminders(
+                        bot=self.bot,
+                        reminder_after_hours=self.settings.ticket_reminder_after_hours,
+                        reminder_interval_minutes=self.settings.ticket_reminder_interval_minutes,
+                    )
+                    if reminders_sent:
+                        logger.info("Ticket reminders sent count=%s", reminders_sent)
+
                 await session.commit()
         except Exception as error:
             logger.exception("Ticket maintenance check failed: %s", error)
+
+    def has_enabled_jobs(self) -> bool:
+        return any(
+            (
+                self.settings.ticket_reminder_enabled,
+                self.settings.ticket_auto_close_enabled,
+                self.settings.user_reply_reminder_enabled,
+            )
+        )

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
-from app.bot.services.ticket_form_service import TicketForm
-from app.bot.services.ticket_service import CLOSE_REASONS, MANUAL_CLOSE_REASON_CODES
+from app.bot.services.ticket_form_service import TicketCloseReason, TicketForm
+from app.bot.services.ticket_service import CLOSE_REASONS, MANUAL_CLOSE_REASON_CODES, CloseReason
 
 
 CALLBACK_OPEN_TICKET = "ticket_open"
@@ -89,11 +89,12 @@ def support_close_ticket_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-def support_close_reason_keyboard() -> ReplyKeyboardMarkup:
+def support_close_reason_keyboard(reasons: list[TicketCloseReason | CloseReason] | None = None) -> ReplyKeyboardMarkup:
+    close_reasons = reasons or [CLOSE_REASONS[reason_code] for reason_code in MANUAL_CLOSE_REASON_CODES]
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=CLOSE_REASONS[reason_code].button_text)]
-            for reason_code in MANUAL_CLOSE_REASON_CODES
+            [KeyboardButton(text=reason.button_text)]
+            for reason in close_reasons
         ],
         resize_keyboard=True,
         one_time_keyboard=True,
@@ -101,16 +102,17 @@ def support_close_reason_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-def close_reason_keyboard(ticket_id: int) -> InlineKeyboardMarkup:
+def close_reason_keyboard(ticket_id: int, reasons: list[TicketCloseReason | CloseReason] | None = None) -> InlineKeyboardMarkup:
+    close_reasons = reasons or [CLOSE_REASONS[reason_code] for reason_code in MANUAL_CLOSE_REASON_CODES]
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text=CLOSE_REASONS[reason_code].button_text,
-                    callback_data=f"{CALLBACK_CLOSE_REASON_PREFIX}{ticket_id}:{reason_code}",
+                    text=reason.button_text,
+                    callback_data=f"{CALLBACK_CLOSE_REASON_PREFIX}{ticket_id}:{reason.id}",
                 )
             ]
-            for reason_code in MANUAL_CLOSE_REASON_CODES
+            for reason in close_reasons
         ]
     )
 

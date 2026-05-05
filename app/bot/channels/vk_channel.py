@@ -31,12 +31,12 @@ class VKChannel:
         try:
             import vk_api
             from vk_api.bot_longpoll import VkBotEventType, VkBotLongPoll
-        except ImportError:
+        except ImportError as error:
             logger.error("vk_api is not installed; VK channel is disabled")
-            return
+            raise RuntimeError("vk_api is not installed") from error
         if not self.settings.vk_group_token or not self.settings.vk_group_id:
             logger.error("VK channel is enabled, but VK_GROUP_TOKEN or VK_GROUP_ID is empty")
-            return
+            raise RuntimeError("VK_GROUP_TOKEN or VK_GROUP_ID is empty")
 
         self.loop = asyncio.get_running_loop()
         self.vk_session = vk_api.VkApi(token=self.settings.vk_group_token)
@@ -56,6 +56,7 @@ class VKChannel:
             await asyncio.to_thread(run_blocking)
         except Exception as error:
             logger.exception("VK channel stopped with error: %s", error)
+            raise
 
     async def stop(self) -> None:
         self._stopped.set()
@@ -114,10 +115,15 @@ class VKChannel:
             keyboard=vk_ui.build_preview_keyboard(),
         )
 
-    async def send_ticket_sent(self, user: Any, ticket_id: int | None = None) -> SentMessageRef | None:
+    async def send_ticket_sent(
+        self,
+        user: Any,
+        ticket_id: int | None = None,
+        success_text: str | None = None,
+    ) -> SentMessageRef | None:
         from app.bot.channels import vk_ui
 
-        return await self._send_vk_message(user.platform_user_id, vk_ui.build_ticket_sent_text(ticket_id))
+        return await self._send_vk_message(user.platform_user_id, vk_ui.build_ticket_sent_text(ticket_id, success_text))
 
     async def send_closed_ticket_menu(self, user: Any, text: str, forms: list[Any]) -> SentMessageRef | None:
         from app.bot.channels import vk_ui

@@ -160,6 +160,7 @@ class PlatformRouter:
         self,
         user: User,
         ticket_id: int | None = None,
+        success_text: str | None = None,
         *,
         telegram_bot: Bot | None = None,
     ) -> SentMessageRef | None:
@@ -167,13 +168,13 @@ class PlatformRouter:
         sender = getattr(adapter, "send_ticket_sent", None) if adapter is not None else None
         if callable(sender):
             try:
-                sent = await sender(user, ticket_id)
+                sent = await sender(user, ticket_id, success_text)
                 if sent is not None:
                     return sent
             except Exception as error:
                 logger.exception("Failed to send platform ticket sent notice platform=%s user_id=%s: %s", user.platform, user.id, error)
-        text = "✅ Тикет отправлен в поддержку. Ответ придёт сюда."
-        if ticket_id is not None:
+        text = success_text or "✅ Тикет отправлен в поддержку.\nОтвет придёт сюда."
+        if ticket_id is not None and success_text is None:
             text = f"{text}\nТикет: #{ticket_id}"
         return await self.send_text(user, text, telegram_bot=telegram_bot)
 

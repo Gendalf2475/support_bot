@@ -28,12 +28,23 @@ class TicketQuestion:
 
 
 @dataclass(frozen=True)
+class TicketCloseReason:
+    id: str
+    title: str
+    button_text: str
+    user_message: str | None = None
+    show_to_user: bool = True
+
+
+@dataclass(frozen=True)
 class TicketForm:
     id: str
     title: str
     description: str
     button_text: str
     admin_title: str
+    success_text: str | None
+    close_reasons: tuple[TicketCloseReason, ...]
     questions: tuple[TicketQuestion, ...]
 
 
@@ -112,6 +123,8 @@ class TicketFormService:
         description = str(raw_form.get("description") or "").strip()
         button_text = str(raw_form.get("button_text") or title).strip()
         admin_title = str(raw_form.get("admin_title") or title).strip()
+        success_text = str(raw_form.get("success_text") or "").strip() or None
+        close_reasons = self._parse_close_reasons(raw_form.get("close_reasons", []), form_id or f"#{index}")
         questions = self._parse_questions(raw_form.get("questions", []), form_id or f"#{index}")
 
         if not form_id:
@@ -142,8 +155,58 @@ class TicketFormService:
             description=description,
             button_text=button_text,
             admin_title=admin_title,
+            success_text=success_text,
+            close_reasons=tuple(close_reasons),
             questions=tuple(questions),
         )
+
+    def _parse_close_reasons(self, raw_reasons: Any, form_label: str) -> list[TicketCloseReason]:
+        if raw_reasons in (None, ""):
+            return []
+        if not isinstance(raw_reasons, list):
+            logger.error("Ticket form '%s' close_reasons must be a list. Reasons are skipped.", form_label)
+            return []
+
+        reasons: list[TicketCloseReason] = []
+        used_ids: set[str] = set()
+        for index, raw_reason in enumerate(raw_reasons, start=1):
+            if not isinstance(raw_reason, dict):
+                logger.error("Close reason #%s in form '%s' must be an object. Reason is skipped.", index, form_label)
+                continue
+
+            reason_id = str(raw_reason.get("id") or "").strip()
+            title = str(raw_reason.get("title") or "").strip()
+            button_text = str(raw_reason.get("button_text") or title).strip()
+            user_message = str(raw_reason.get("user_message") or "").strip() or None
+            show_to_user = bool(raw_reason.get("show_to_user", True))
+
+            if not reason_id:
+                logger.error("Close reason #%s in form '%s' has empty id. Reason is skipped.", index, form_label)
+                continue
+            if reason_id in used_ids:
+                logger.error("Close reason '%s' in form '%s' has duplicate id. Reason is skipped.", reason_id, form_label)
+                continue
+            if len(f"ticket_close_reason:0:{reason_id}") > 64:
+                logger.error("Close reason '%s' in form '%s' id is too long for Telegram callback data. Reason is skipped.", reason_id, form_label)
+                continue
+            if not title:
+                logger.error("Close reason '%s' in form '%s' has empty title. Reason is skipped.", reason_id, form_label)
+                continue
+            if not button_text:
+                logger.error("Close reason '%s' in form '%s' has empty button_text. Reason is skipped.", reason_id, form_label)
+                continue
+
+            reasons.append(
+                TicketCloseReason(
+                    id=reason_id,
+                    title=title,
+                    button_text=button_text,
+                    user_message=user_message,
+                    show_to_user=show_to_user,
+                )
+            )
+            used_ids.add(reason_id)
+        return reasons
 
     def _parse_questions(self, raw_questions: Any, form_label: str) -> list[TicketQuestion]:
         if not isinstance(raw_questions, list):
@@ -218,6 +281,8 @@ class TicketFormService:
             description="Свободное обращение в поддержку",
             button_text="💬 Другое",
             admin_title="Другое обращение",
+            success_text=None,
+            close_reasons=(),
             questions=(
                 TicketQuestion(
                     id="message",

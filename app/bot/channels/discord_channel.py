@@ -25,12 +25,12 @@ class DiscordChannel:
             return
         try:
             import discord
-        except ImportError:
+        except ImportError as error:
             logger.error("discord.py is not installed; Discord channel is disabled")
-            return
+            raise RuntimeError("discord.py is not installed") from error
         if not self.settings.discord_bot_token:
             logger.error("Discord channel is enabled, but DISCORD_BOT_TOKEN is empty")
-            return
+            raise RuntimeError("DISCORD_BOT_TOKEN is empty")
 
         intents = discord.Intents.default()
         intents.dm_messages = True
@@ -53,6 +53,7 @@ class DiscordChannel:
             await client.start(self.settings.discord_bot_token)
         except Exception as error:
             logger.exception("Discord channel stopped with error: %s", error)
+            raise
 
     async def stop(self) -> None:
         if self.client is not None:
@@ -136,9 +137,14 @@ class DiscordChannel:
         )
         return await self._send_discord_dm(user.platform_user_id, embed=embed, view=view)
 
-    async def send_ticket_sent(self, user: Any, ticket_id: int | None = None) -> SentMessageRef | None:
+    async def send_ticket_sent(
+        self,
+        user: Any,
+        ticket_id: int | None = None,
+        success_text: str | None = None,
+    ) -> SentMessageRef | None:
         discord_ui = self._discord_ui()
-        embed = discord_ui.build_ticket_sent_embed(ticket_id)
+        embed = discord_ui.build_ticket_sent_embed(ticket_id, success_text)
         return await self._send_discord_dm(user.platform_user_id, embed=embed)
 
     async def send_closed_ticket_menu(self, user: Any, text: str, forms: list[Any]) -> SentMessageRef | None:

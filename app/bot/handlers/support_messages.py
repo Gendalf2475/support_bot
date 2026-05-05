@@ -38,14 +38,18 @@ async def handle_support_message(
         logger.info("Ignored support message from unknown topic_id=%s", message.message_thread_id)
         return
 
-    ticket = await TicketService(session, settings.support_chat_id).get_open_ticket_by_topic_id(message.message_thread_id)
+    ticket_service = TicketService(session, settings.support_chat_id)
+    ticket = await ticket_service.get_open_ticket_by_topic_id(message.message_thread_id)
     if ticket is None:
         logger.info("Ignored support message from topic without open ticket topic_id=%s", message.message_thread_id)
         return
 
     message_service = MessageService(session, settings.support_chat_id)
+    delivered = None
     if user.platform == Platform.TELEGRAM.value:
-        await message_service.copy_support_message_to_user(bot, message, user, ticket)
+        delivered = await message_service.copy_support_message_to_user(bot, message, user, ticket)
+        if delivered is not None:
+            await ticket_service.mark_support_activity(ticket)
         return
 
     if platform_router is None:
@@ -53,7 +57,9 @@ async def handle_support_message(
         await message.answer("Не настроен адаптер платформы пользователя.")
         return
 
-    await platform_router.send_support_message(session, bot, message, user, ticket)
+    delivered = await platform_router.send_support_message(session, bot, message, user, ticket)
+    if delivered is not None:
+        await ticket_service.mark_support_activity(ticket)
 
 
 @router.edited_message()

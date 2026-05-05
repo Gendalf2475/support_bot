@@ -131,9 +131,9 @@ def build_preview_text(form: TicketForm, answers: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def build_ticket_sent_text(ticket_id: int | None = None) -> str:
-    text = "✅ Тикет отправлен в поддержку.\nОтвет придёт сюда."
-    if ticket_id is not None:
+def build_ticket_sent_text(ticket_id: int | None = None, success_text: str | None = None) -> str:
+    text = success_text or "✅ Тикет отправлен в поддержку.\nОтвет придёт сюда."
+    if ticket_id is not None and success_text is None:
         text = f"{text}\n\nТикет: #{ticket_id}"
     return text
 

@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable
 
 from aiogram import Bot, Dispatcher
+from aiogram.exceptions import TelegramAPIError
 
 from app.bot.channels.discord_channel import DiscordChannel
 from app.bot.channels.telegram_channel import TelegramChannel
 from app.bot.channels.vk_channel import VKChannel
-from app.bot.config import get_settings
+from app.bot.config import Settings, get_settings
 from app.bot.database.session import create_sessionmaker
 from app.bot.handlers import admin, support_messages, user_messages
 from app.bot.middlewares.block_check import BlockCheckMiddleware, DatabaseSessionMiddleware
@@ -20,6 +22,7 @@ from app.bot.services.ticket_scheduler import TicketMaintenanceScheduler
 
 
 logger = logging.getLogger(__name__)
+CHANNEL_FAILURE_NOTIFIED_AT: dict[str, float] = {}
 
 
 def setup_logging(level: str) -> None:
@@ -68,7 +71,7 @@ async def main() -> None:
 
     channel_tasks: list[asyncio.Task[None]] = []
     try:
-        channel_tasks = start_optional_channels(discord_channel, vk_channel)
+        channel_tasks = start_optional_channels(bot, settings, discord_channel, vk_channel)
         ticket_scheduler.start()
         await bot.delete_webhook(drop_pending_updates=True)
         await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())
@@ -81,24 +84,61 @@ async def main() -> None:
         await bot.session.close()
 
 
-def start_optional_channels(discord_channel: DiscordChannel, vk_channel: VKChannel) -> list[asyncio.Task[None]]:
+def start_optional_channels(bot: Bot, settings: Settings, discord_channel: DiscordChannel, vk_channel: VKChannel) -> list[asyncio.Task[None]]:
     tasks: list[asyncio.Task[None]] = []
     for name, starter in (
         ("discord", discord_channel.start),
         ("vk", vk_channel.start),
     ):
-        task = asyncio.create_task(run_channel(name, starter))
+        task = asyncio.create_task(run_channel(name, starter, bot, settings))
         tasks.append(task)
     return tasks
 
 
-async def run_channel(name: str, starter: Callable[[], Awaitable[None]]) -> None:
+async def run_channel(name: str, starter: Callable[[], Awaitable[None]], bot: Bot, settings: Settings) -> None:
     try:
         await starter()
     except asyncio.CancelledError:
         raise
     except Exception as error:
         logger.exception("%s channel crashed: %s", name, error)
+        await notify_channel_failure(bot, settings, name, error)
+
+
+async def notify_channel_failure(bot: Bot, settings: Settings, channel_name: str, error: Exception) -> None:
+    if not settings.channel_failure_notify_enabled:
+        return
+
+    cooldown_seconds = max(0, settings.channel_failure_notify_cooldown_minutes) * 60
+    now = time.monotonic()
+    last_notified_at = CHANNEL_FAILURE_NOTIFIED_AT.get(channel_name)
+    if last_notified_at is not None and now - last_notified_at < cooldown_seconds:
+        return
+
+    CHANNEL_FAILURE_NOTIFIED_AT[channel_name] = now
+    display_name = "Discord" if channel_name == "discord" else "VK" if channel_name == "vk" else channel_name
+    text = f"⚠️ {display_name}-канал отключился: {classify_channel_failure(channel_name, error)}."
+    try:
+        await bot.send_message(chat_id=settings.support_chat_id, text=text)
+    except TelegramAPIError as notify_error:
+        logger.error("Failed to notify support chat about %s channel failure: %s", channel_name, notify_error)
+
+
+def classify_channel_failure(channel_name: str, error: Exception) -> str:
+    error_type = type(error).__name__
+    error_text = str(error)
+    normalized = f"{error_type} {error_text}".casefold()
+    if channel_name == "vk":
+        if "[27]" in error_text or "group authorization failed" in normalized or "authorization failed" in normalized:
+            return "ошибка авторизации"
+        if "[15]" in error_text or "access denied" in normalized:
+            return "нет нужных прав у токена"
+    if channel_name == "discord":
+        if "privilegedintentsrequired" in normalized or "privileged intents" in normalized:
+            return "не включены нужные intents"
+        if "loginfailure" in normalized or "improper token" in normalized:
+            return "ошибка токена Discord"
+    return "unexpected error. Подробности в логах"
 
 
 if __name__ == "__main__":
