@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Any
 
 from aiogram import Bot
@@ -11,7 +12,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.bot.channels.base import ChannelAdapter, OutgoingMessage, SentMessageRef
 from app.bot.database.models import MessageDirection, Platform, Ticket, User
 from app.bot.services.message_service import MessageService
-from app.bot.services.ticket_form_service import TicketForm
+from app.bot.services.ticket_form_service import (
+    PROFILE_FIELD_MINECRAFT_NICKNAME,
+    PROFILE_FIELD_MINECRAFT_TARGET_NICKNAME,
+    TicketForm,
+    TicketQuestion,
+    get_minecraft_profile_field,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -20,9 +27,21 @@ logger = logging.getLogger(__name__)
 class PlatformRouter:
     def __init__(self) -> None:
         self.adapters: dict[str, ChannelAdapter] = {}
+        self._state_clearer: Callable[[str, str], None] | None = None
 
     def register(self, adapter: ChannelAdapter) -> None:
         self.adapters[adapter.platform] = adapter
+
+    def register_state_clearer(self, clearer: Callable[[str, str], None]) -> None:
+        self._state_clearer = clearer
+
+    def clear_user_state(self, platform: str, platform_user_id: str | None) -> None:
+        if self._state_clearer is None or not platform_user_id:
+            return
+        try:
+            self._state_clearer(platform, str(platform_user_id))
+        except Exception as error:
+            logger.exception("Failed to clear platform state platform=%s platform_user_id=%s: %s", platform, platform_user_id, error)
 
     async def send_text(
         self,
@@ -121,20 +140,45 @@ class PlatformRouter:
         question_index: int,
         nickname: str,
         *,
+        change_label: str = "Ввести другой",
+        text: str | None = None,
         telegram_bot: Bot | None = None,
     ) -> SentMessageRef | None:
         adapter = self.adapters.get(user.platform)
         sender = getattr(adapter, "send_minecraft_nickname_offer", None) if adapter is not None else None
         if callable(sender):
             try:
-                sent = await sender(user, question_index, nickname)
+                sent = await sender(user, question_index, nickname, change_label=change_label, text=text)
                 if sent is not None:
                     return sent
             except Exception as error:
                 logger.exception("Failed to send platform Minecraft nickname offer platform=%s user_id=%s: %s", user.platform, user.id, error)
         return await self.send_text(
             user,
-            build_minecraft_nickname_offer_text(nickname),
+            text or build_minecraft_nickname_offer_text(nickname, change_label),
+            telegram_bot=telegram_bot,
+        )
+
+    async def send_minecraft_nickname_change_confirmation(
+        self,
+        user: User,
+        question_index: int,
+        nickname: str,
+        *,
+        telegram_bot: Bot | None = None,
+    ) -> SentMessageRef | None:
+        adapter = self.adapters.get(user.platform)
+        sender = getattr(adapter, "send_minecraft_nickname_change_confirmation", None) if adapter is not None else None
+        if callable(sender):
+            try:
+                sent = await sender(user, question_index, nickname)
+                if sent is not None:
+                    return sent
+            except Exception as error:
+                logger.exception("Failed to send platform Minecraft nickname change confirmation platform=%s user_id=%s: %s", user.platform, user.id, error)
+        return await self.send_text(
+            user,
+            build_minecraft_nickname_change_confirmation_text(nickname),
             telegram_bot=telegram_bot,
         )
 
@@ -332,8 +376,17 @@ def build_external_question_text(form: TicketForm, question_index: int, prefix_t
     return "\n".join(lines)
 
 
-def build_minecraft_nickname_offer_text(nickname: str) -> str:
-    return f"Использовать прошлый ник {nickname}?\n\nНапишите: Да или Ввести другой."
+def build_minecraft_nickname_offer_text(nickname: str, change_label: str = "Ввести другой") -> str:
+    return f"Использовать прошлый ник {nickname}?\n\nНапишите: Да или {change_label}."
+
+
+def build_minecraft_nickname_change_confirmation_text(nickname: str) -> str:
+    return (
+        f"У вас уже закреплён игровой ник: {nickname}.\n"
+        "Изменить ник можно только через подтверждение.\n\n"
+        "Продолжить смену ника?\n\n"
+        "Напишите: Да, изменить или Отмена."
+    )
 
 
 def build_minecraft_lookup_confirmation_text(nickname: str) -> str:
@@ -372,11 +425,20 @@ def build_external_preview_text(form: TicketForm, answers: list[dict[str, Any]])
     answers_by_question = {answer.get("question_id"): answer for answer in answers}
     for question in form.questions:
         answer = answers_by_question.get(question.id)
-        lines.append(f"{question.text.strip().rstrip(':')}:")
+        lines.append(f"{build_preview_question_label(question)}:")
         lines.append(format_external_preview_answer(answer))
         lines.append("")
     lines.append("Отправить тикет?")
     return "\n".join(lines)
+
+
+def build_preview_question_label(question: TicketQuestion) -> str:
+    profile_field = get_minecraft_profile_field(question)
+    if profile_field == PROFILE_FIELD_MINECRAFT_NICKNAME:
+        return "Игровой ник"
+    if profile_field == PROFILE_FIELD_MINECRAFT_TARGET_NICKNAME:
+        return "Ник нарушителя"
+    return question.text.strip().rstrip(":")
 
 
 def format_external_preview_answer(answer: dict[str, Any] | None) -> str:

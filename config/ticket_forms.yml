@@ -1,5 +1,16 @@
 enabled: true
 
+global_questions:
+  - id: "minecraft_nickname"
+    text: "Введите ваш игровой ник:"
+    help_text: "Укажите ник точно так же, как он отображается на сервере."
+    required: true
+    answer_type: "text"
+    profile_field: "minecraft_nickname"
+    validation_regex: "^[A-Za-z0-9_]{3,16}$"
+    validation_error: "Введите корректный Minecraft-ник: 3–16 символов, латиница, цифры или _."
+    locked: true
+
 forms:
   - id: "forgot_password"
     title: "Забыл пароль"
@@ -32,15 +43,6 @@ forms:
           Обращение закрыто: не удалось подтвердить владение аккаунтом.
         show_to_user: true
     questions:
-      - id: "nickname"
-        text: "Введите ваш игровой ник:"
-        help_text: "Укажите ник точно так же, как он отображается на сервере."
-        required: true
-        answer_type: "text"
-        profile_field: "minecraft_nickname"
-        validation_regex: "^[A-Za-z0-9_]{3,16}$"
-        validation_error: "Введите корректный Minecraft-ник: 3–16 символов, латиница, цифры или _."
-
       - id: "last_login"
         text: "Когда вы примерно последний раз заходили на сервер?"
         help_text: "Например: вчера вечером, неделю назад, 15 апреля."
@@ -87,15 +89,6 @@ forms:
           Этот тикет закрыт как дубликат.
         show_to_user: true
     questions:
-      - id: "your_nickname"
-        text: "Введите ваш игровой ник:"
-        help_text: "Укажите ник точно так же, как он отображается на сервере."
-        required: true
-        answer_type: "text"
-        profile_field: "minecraft_nickname"
-        validation_regex: "^[A-Za-z0-9_]{3,16}$"
-        validation_error: "Введите корректный Minecraft-ник: 3–16 символов, латиница, цифры или _."
-
       - id: "violator_nickname"
         text: "Введите ник нарушителя:"
         help_text: "Укажите один ник точно так же, как он отображается на сервере."
@@ -142,15 +135,6 @@ forms:
           Ваше обращение закрыто, так как от вас не поступил ответ.
         show_to_user: true
     questions:
-      - id: "your_nickname"
-        text: "Введите ваш игровой ник:"
-        help_text: "Укажите ник точно так же, как он отображается на сервере."
-        required: true
-        answer_type: "text"
-        profile_field: "minecraft_nickname"
-        validation_regex: "^[A-Za-z0-9_]{3,16}$"
-        validation_error: "Введите корректный Minecraft-ник: 3–16 символов, латиница, цифры или _."
-
       - id: "message"
         text: "Опишите вашу проблему:"
         help_text: "Постарайтесь описать ситуацию максимально подробно."

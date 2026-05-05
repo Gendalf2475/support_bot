@@ -4,7 +4,14 @@ import json
 import logging
 from typing import Any
 
-from app.bot.services.ticket_form_service import ANSWER_TYPE_MEDIA, TicketForm, TicketQuestion
+from app.bot.services.ticket_form_service import (
+    ANSWER_TYPE_MEDIA,
+    PROFILE_FIELD_MINECRAFT_NICKNAME,
+    PROFILE_FIELD_MINECRAFT_TARGET_NICKNAME,
+    TicketForm,
+    TicketQuestion,
+    get_minecraft_profile_field,
+)
 from app.bot.services.ticket_service import TicketService
 
 
@@ -44,12 +51,23 @@ def build_media_continue_keyboard() -> str:
     )
 
 
-def build_minecraft_nickname_keyboard() -> str:
+def build_minecraft_nickname_keyboard(*, change_label: str = "Ввести другой") -> str:
     return _keyboard(
         [
             [
                 _button("Да", "positive", {"action": "profile_yes"}),
-                _button("Ввести другой", "secondary", {"action": "profile_other"}),
+                _button(change_label, "secondary", {"action": "profile_other"}),
+            ]
+        ]
+    )
+
+
+def build_minecraft_nickname_change_confirm_keyboard() -> str:
+    return _keyboard(
+        [
+            [
+                _button("Да, изменить", "negative", {"action": "profile_change_confirm"}),
+                _button("Отмена", "secondary", {"action": "profile_change_cancel"}),
             ]
         ]
     )
@@ -140,6 +158,14 @@ def build_minecraft_nickname_text(nickname: str) -> str:
     return f"Использовать прошлый ник {nickname}?"
 
 
+def build_minecraft_nickname_change_confirmation_text(nickname: str) -> str:
+    return (
+        f"У вас уже закреплён игровой ник: {nickname}.\n"
+        "Изменить ник можно только через подтверждение.\n\n"
+        "Продолжить смену ника?"
+    )
+
+
 def build_minecraft_lookup_not_found_text(nickname: str) -> str:
     return (
         f"⚠️ Игрок с ником {nickname} не найден на сервере.\n"
@@ -157,11 +183,20 @@ def build_preview_text(form: TicketForm, answers: list[dict[str, Any]]) -> str:
     answers_by_question = {answer.get("question_id"): answer for answer in answers}
     for question_number, question in enumerate(form.questions, start=1):
         answer = answers_by_question.get(question.id)
-        lines.append(f"{question_number}. {question.text.strip().rstrip(':')}")
+        lines.append(f"{question_number}. {_preview_question_label(question)}")
         lines.append(_format_preview_answer(answer))
         lines.append("")
     lines.append("Отправить тикет?")
     return "\n".join(lines)
+
+
+def _preview_question_label(question: TicketQuestion) -> str:
+    profile_field = get_minecraft_profile_field(question)
+    if profile_field == PROFILE_FIELD_MINECRAFT_NICKNAME:
+        return "Игровой ник"
+    if profile_field == PROFILE_FIELD_MINECRAFT_TARGET_NICKNAME:
+        return "Ник нарушителя"
+    return question.text.strip().rstrip(":")
 
 
 def build_ticket_sent_text(ticket_id: int | None = None, success_text: str | None = None) -> str:

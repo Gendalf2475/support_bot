@@ -36,6 +36,7 @@ class TicketQuestion:
     profile_field: str | None = None
     validation_regex: str | None = None
     validation_error: str | None = None
+    locked: bool = False
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,10 @@ class TicketCloseReason:
     button_text: str
     user_message: str | None = None
     show_to_user: bool = True
+
+    @property
+    def label(self) -> str:
+        return self.title or self.button_text or self.id
 
 
 @dataclass(frozen=True)
@@ -60,9 +65,11 @@ class TicketForm:
 
 
 class TicketFormService:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, global_questions_enabled: bool = True) -> None:
         self.path = path
+        self.global_questions_enabled = global_questions_enabled
         self.enabled = True
+        self.global_questions: list[TicketQuestion] = []
         self.forms: list[TicketForm] = []
         self.load()
 
@@ -94,13 +101,20 @@ class TicketFormService:
             return
 
         self.enabled = bool(data.get("enabled", True))
+        self.global_questions = self._parse_questions(data.get("global_questions", []), "global_questions")
         parsed_forms = self._parse_forms(data.get("forms", []))
         if not parsed_forms:
             logger.error("Ticket forms file %s does not contain valid forms. Fallback form will be used.", self.path)
             parsed_forms = [self.fallback_form()]
 
         self.forms = parsed_forms
-        logger.info("Loaded ticket forms: enabled=%s forms=%s", self.enabled, len(self.forms))
+        logger.info(
+            "Loaded ticket forms: enabled=%s forms=%s global_questions=%s global_questions_enabled=%s",
+            self.enabled,
+            len(self.forms),
+            len(self.global_questions),
+            self.global_questions_enabled,
+        )
 
     def get_forms(self) -> list[TicketForm]:
         return list(self.forms)
@@ -136,7 +150,8 @@ class TicketFormService:
         admin_title = str(raw_form.get("admin_title") or title).strip()
         success_text = str(raw_form.get("success_text") or "").strip() or None
         close_reasons = self._parse_close_reasons(raw_form.get("close_reasons", []), form_id or f"#{index}")
-        questions = self._parse_questions(raw_form.get("questions", []), form_id or f"#{index}")
+        local_questions = self._parse_questions(raw_form.get("questions", []), form_id or f"#{index}")
+        questions = self._merge_global_questions(form_id or f"#{index}", local_questions)
 
         if not form_id:
             logger.error("Ticket form #%s has empty id. Form is skipped.", index)
@@ -241,6 +256,7 @@ class TicketFormService:
             profile_field = str(raw_question.get("profile_field") or "").strip() or None
             validation_regex = str(raw_question.get("validation_regex") or "").strip() or None
             validation_error = str(raw_question.get("validation_error") or "").strip() or None
+            locked = bool(raw_question.get("locked", False))
 
             if not question_id:
                 logger.error("Question #%s in form '%s' has empty id. Question is skipped.", index, form_label)
@@ -272,11 +288,43 @@ class TicketFormService:
                     profile_field=profile_field,
                     validation_regex=validation_regex,
                     validation_error=validation_error,
+                    locked=locked,
                 )
             )
             used_ids.add(question_id)
 
         return questions
+
+    def _merge_global_questions(self, form_label: str, local_questions: list[TicketQuestion]) -> list[TicketQuestion]:
+        if not self.global_questions_enabled or not self.global_questions:
+            return local_questions
+
+        merged: list[TicketQuestion] = list(self.global_questions)
+        global_profile_fields = {
+            profile_field
+            for question in self.global_questions
+            if (profile_field := get_minecraft_profile_field(question)) is not None
+        }
+        global_ids = {question.id for question in self.global_questions}
+
+        for question in local_questions:
+            profile_field = get_minecraft_profile_field(question)
+            if profile_field == PROFILE_FIELD_MINECRAFT_NICKNAME and profile_field in global_profile_fields:
+                logger.warning(
+                    "Ticket form '%s' has duplicate minecraft_nickname question '%s'; global question is used.",
+                    form_label,
+                    question.id,
+                )
+                continue
+            if question.id in global_ids:
+                logger.warning(
+                    "Ticket form '%s' has duplicate global question id '%s'; local question is skipped.",
+                    form_label,
+                    question.id,
+                )
+                continue
+            merged.append(question)
+        return merged
 
     @staticmethod
     def _parse_max_files(raw_value: Any, allow_multiple: bool) -> int | None:

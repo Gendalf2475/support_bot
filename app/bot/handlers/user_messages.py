@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import timedelta
 from typing import Any
 
 from aiogram import Bot, F, Router
@@ -23,12 +24,15 @@ from app.bot.keyboards import (
     CALLBACK_MINECRAFT_LOOKUP_CONTINUE,
     CALLBACK_MINECRAFT_LOOKUP_OTHER,
     CALLBACK_OPEN_TICKET,
+    CALLBACK_PROFILE_NICKNAME_CHANGE_CANCEL,
+    CALLBACK_PROFILE_NICKNAME_CHANGE_CONFIRM,
     CALLBACK_PROFILE_NICKNAME_OTHER,
     CALLBACK_PROFILE_NICKNAME_YES,
     CALLBACK_RESTART_TICKET,
     CALLBACK_SKIP_QUESTION,
     CALLBACK_SUBMIT_TICKET,
     minecraft_lookup_confirmation_keyboard,
+    minecraft_nickname_change_confirm_keyboard,
     minecraft_nickname_keyboard,
     multiple_media_keyboard,
     open_ticket_keyboard,
@@ -89,6 +93,7 @@ CONTINUE_MEDIA_LOCKS: dict[int, asyncio.Lock] = {}
 
 class TicketFlow(StatesGroup):
     profile_choice = State()
+    profile_change_confirm = State()
     minecraft_lookup_confirm = State()
     answering = State()
     confirming = State()
@@ -116,9 +121,11 @@ async def start(
     ticket_service = TicketService(session, settings.support_chat_id)
     open_ticket = await ticket_service.get_open_ticket_by_user_id(user.id)
     if open_ticket:
+        logger.info("/start active ticket found user_id=%s ticket_id=%s status=%s", user.id, open_ticket.id, open_ticket.status.value)
         await message.answer(OPEN_TICKET_EXISTS_TEXT, reply_markup=ReplyKeyboardRemove())
         return
 
+    logger.info("/start no active ticket found user_id=%s", user.id)
     await show_ticket_forms(message, ticket_form_service)
 
 
@@ -144,6 +151,7 @@ async def open_ticket(
     ticket_service = TicketService(session, settings.support_chat_id)
     open_ticket = await ticket_service.get_open_ticket_by_user_id(user.id)
     if open_ticket:
+        logger.info("Selected form callback active ticket found user_id=%s ticket_id=%s status=%s", user.id, open_ticket.id, open_ticket.status.value)
         await message.answer(OPEN_TICKET_EXISTS_TEXT, reply_markup=ReplyKeyboardRemove())
         await callback.answer()
         return
@@ -164,6 +172,7 @@ async def choose_form(
     settings: Settings,
     state: FSMContext,
     ticket_form_service: TicketFormService,
+    minecraft_service: MinecraftService,
     known_user: User | None = None,
 ) -> None:
     message = callback.message
@@ -195,7 +204,17 @@ async def choose_form(
         await callback.answer("Форма не найдена. Попробуйте открыть список заново.", show_alert=True)
         return
 
-    await start_form_flow(message, state, form, user, settings)
+    logger.info("Selected form_id=%s user_id=%s active_ticket_found=%s", form.id, user.id, False)
+    await start_form_flow(
+        message,
+        state,
+        form,
+        user,
+        settings,
+        session=session,
+        ticket_form_service=ticket_form_service,
+        minecraft_service=minecraft_service,
+    )
     await callback.answer()
 
 
@@ -222,25 +241,20 @@ async def use_saved_minecraft_nickname(
 @router.callback_query(StateFilter(TicketFlow.profile_choice), F.data == CALLBACK_PROFILE_NICKNAME_OTHER)
 async def enter_other_minecraft_nickname(
     callback: CallbackQuery,
+    session: AsyncSession,
+    settings: Settings,
     state: FSMContext,
     ticket_form_service: TicketFormService,
+    known_user: User | None = None,
 ) -> None:
     message = callback.message
     if not isinstance(message, Message) or message.chat.type != ChatType.PRIVATE:
         await callback.answer("Действие доступно только в личном чате с ботом.", show_alert=True)
         return
 
-    data = await state.get_data()
-    form = get_state_form(ticket_form_service, data)
-    question_index = int(data.get("question_index", 0))
-    if form is None or question_index >= len(form.questions):
-        await state.clear()
-        await callback.answer("Форма устарела. Откройте тикет заново.", show_alert=True)
-        return
-
-    await state.set_state(TicketFlow.answering)
-    await ask_current_question(message, form, question_index)
-    await callback.answer()
+    user = await get_or_create_user(session, callback.from_user, known_user)
+    changed = await begin_minecraft_nickname_change(message, session, state, ticket_form_service, user, settings)
+    await callback.answer("" if changed else "Действие устарело.", show_alert=not changed)
 
 
 @router.message(StateFilter(TicketFlow.profile_choice), F.chat.type == ChatType.PRIVATE)
@@ -259,6 +273,8 @@ async def handle_minecraft_nickname_choice_text(
         return
 
     user = await get_or_create_user(session, message.from_user, known_user)
+    if await try_start_form_from_text_if_no_active_ticket(message, session, settings, state, ticket_form_service, minecraft_service, user):
+        return
     data = await state.get_data()
     form = get_state_form(ticket_form_service, data)
     question_index = int(data.get("question_index", 0))
@@ -270,13 +286,10 @@ async def handle_minecraft_nickname_choice_text(
         await message.answer("Это действие уже неактуально.")
         return
 
-    if text in {"ввести другой", "другой", "нет", "no"}:
-        if form is None or question_index >= len(form.questions):
-            await state.clear()
-            await show_ticket_forms(message, ticket_form_service)
+    if text in {"изменить ник", "ввести другой", "другой", "нет", "no"}:
+        if await begin_minecraft_nickname_change(message, session, state, ticket_form_service, user, settings):
             return
-        await state.set_state(TicketFlow.answering)
-        await ask_current_question(message, form, question_index)
+        await message.answer("Это действие уже неактуально.")
         return
 
     if text in {"отмена", "cancel"}:
@@ -294,8 +307,102 @@ async def handle_minecraft_nickname_choice_text(
         return
 
     await message.answer(
-        "Напишите: Да или Ввести другой.",
-        reply_markup=minecraft_nickname_keyboard(),
+        "Напишите: Да или Изменить ник.",
+        reply_markup=minecraft_nickname_keyboard(change_label=get_profile_change_label(settings, form.questions[question_index] if form and question_index < len(form.questions) else None)),
+    )
+
+
+@router.callback_query(StateFilter(TicketFlow.profile_change_confirm), F.data == CALLBACK_PROFILE_NICKNAME_CHANGE_CONFIRM)
+async def confirm_minecraft_nickname_change(
+    callback: CallbackQuery,
+    state: FSMContext,
+    ticket_form_service: TicketFormService,
+) -> None:
+    message = callback.message
+    if not isinstance(message, Message) or message.chat.type != ChatType.PRIVATE:
+        await callback.answer("Действие доступно только в личном чате с ботом.", show_alert=True)
+        return
+
+    data = await state.get_data()
+    form = get_state_form(ticket_form_service, data)
+    question_index = int(data.get("question_index", 0))
+    if form is None or question_index >= len(form.questions):
+        await state.clear()
+        await callback.answer("Форма устарела. Откройте тикет заново.", show_alert=True)
+        return
+
+    await state.set_state(TicketFlow.answering)
+    await state.update_data(changing_minecraft_nickname=True)
+    await ask_current_question(message, form, question_index, prefix_text="Введите новый игровой ник:")
+    await callback.answer()
+
+
+@router.callback_query(StateFilter(TicketFlow.profile_change_confirm), F.data == CALLBACK_PROFILE_NICKNAME_CHANGE_CANCEL)
+async def cancel_minecraft_nickname_change(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    settings: Settings,
+    state: FSMContext,
+    ticket_form_service: TicketFormService,
+    minecraft_service: MinecraftService,
+    known_user: User | None = None,
+) -> None:
+    message = callback.message
+    if not isinstance(message, Message) or message.chat.type != ChatType.PRIVATE:
+        await callback.answer("Действие доступно только в личном чате с ботом.", show_alert=True)
+        return
+
+    user = await get_or_create_user(session, callback.from_user, known_user)
+    if await apply_saved_minecraft_nickname(message, session, state, ticket_form_service, minecraft_service, user, settings):
+        await callback.answer()
+        return
+    await state.clear()
+    await show_ticket_forms(message, ticket_form_service)
+    await callback.answer()
+
+
+@router.message(StateFilter(TicketFlow.profile_change_confirm), F.chat.type == ChatType.PRIVATE)
+async def handle_minecraft_nickname_change_confirm_text(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+    state: FSMContext,
+    ticket_form_service: TicketFormService,
+    minecraft_service: MinecraftService,
+    known_user: User | None = None,
+) -> None:
+    if message.from_user is None or message.from_user.is_bot:
+        return
+    if is_command_message(message):
+        return
+
+    user = await get_or_create_user(session, message.from_user, known_user)
+    if await try_start_form_from_text_if_no_active_ticket(message, session, settings, state, ticket_form_service, minecraft_service, user):
+        return
+    text = (message.text or "").strip().casefold()
+    if text in {"да", "да, изменить", "изменить", "yes", "y"}:
+        data = await state.get_data()
+        form = get_state_form(ticket_form_service, data)
+        question_index = int(data.get("question_index", 0))
+        if form is None or question_index >= len(form.questions):
+            await state.clear()
+            await show_ticket_forms(message, ticket_form_service)
+            return
+        await state.set_state(TicketFlow.answering)
+        await state.update_data(changing_minecraft_nickname=True)
+        await ask_current_question(message, form, question_index, prefix_text="Введите новый игровой ник:")
+        return
+
+    if text in {"отмена", "cancel"}:
+        if await apply_saved_minecraft_nickname(message, session, state, ticket_form_service, minecraft_service, user, settings):
+            return
+        await state.clear()
+        await show_ticket_forms(message, ticket_form_service)
+        return
+
+    await message.answer(
+        "Напишите: Да, изменить или Отмена.",
+        reply_markup=minecraft_nickname_change_confirm_keyboard(),
     )
 
 
@@ -306,6 +413,7 @@ async def continue_with_unverified_minecraft_nickname(
     settings: Settings,
     state: FSMContext,
     ticket_form_service: TicketFormService,
+    minecraft_service: MinecraftService,
     known_user: User | None = None,
 ) -> None:
     message = callback.message
@@ -314,7 +422,7 @@ async def continue_with_unverified_minecraft_nickname(
         return
 
     user = await get_or_create_user(session, callback.from_user, known_user)
-    continued = await accept_pending_minecraft_lookup_answer(message, session, state, ticket_form_service, user, settings)
+    continued = await accept_pending_minecraft_lookup_answer(message, session, state, ticket_form_service, minecraft_service, user, settings)
     await callback.answer("" if continued else "Действие устарело.", show_alert=not continued)
 
 
@@ -349,8 +457,10 @@ async def handle_minecraft_lookup_confirmation_text(
 
     text = (message.text or "").strip().casefold()
     user = await get_or_create_user(session, message.from_user, known_user)
+    if await try_start_form_from_text_if_no_active_ticket(message, session, settings, state, ticket_form_service, minecraft_service, user):
+        return
     if text in {"продолжить", "continue", "далее"}:
-        if await accept_pending_minecraft_lookup_answer(message, session, state, ticket_form_service, user, settings):
+        if await accept_pending_minecraft_lookup_answer(message, session, state, ticket_form_service, minecraft_service, user, settings):
             return
         await message.answer("Это действие уже неактуально.")
         return
@@ -398,6 +508,8 @@ async def handle_form_answer(
         return
 
     user = await get_or_create_user(session, message.from_user, known_user)
+    if await try_start_form_from_text_if_no_active_ticket(message, session, settings, state, ticket_form_service, minecraft_service, user):
+        return
     if is_blocked_user or user.blocked:
         await message.answer(BLOCKED_TEXT, reply_markup=ReplyKeyboardRemove())
         return
@@ -495,7 +607,18 @@ async def handle_form_answer(
 
     await maybe_save_minecraft_nickname(session, user, question, answer)
     answers.append(answer)
-    await move_to_next_question_or_summary(message, state, form, answers, question_index + 1, user=user, settings=settings)
+    await move_to_next_question_or_summary(
+        message,
+        state,
+        form,
+        answers,
+        question_index + 1,
+        user=user,
+        settings=settings,
+        session=session,
+        ticket_form_service=ticket_form_service,
+        minecraft_service=minecraft_service,
+    )
 
 
 @router.callback_query(StateFilter(TicketFlow.answering), F.data == CALLBACK_SKIP_QUESTION)
@@ -505,6 +628,7 @@ async def skip_question(
     settings: Settings,
     state: FSMContext,
     ticket_form_service: TicketFormService,
+    minecraft_service: MinecraftService,
     known_user: User | None = None,
 ) -> None:
     message = callback.message
@@ -532,7 +656,18 @@ async def skip_question(
     answers = list(data.get("answers", []))
     answers.append(build_skipped_answer(question))
     user = await get_or_create_user(session, callback.from_user, known_user)
-    await move_to_next_question_or_summary(message, state, form, answers, question_index + 1, user=user, settings=settings)
+    await move_to_next_question_or_summary(
+        message,
+        state,
+        form,
+        answers,
+        question_index + 1,
+        user=user,
+        settings=settings,
+        session=session,
+        ticket_form_service=ticket_form_service,
+        minecraft_service=minecraft_service,
+    )
     await callback.answer()
 
 
@@ -546,6 +681,7 @@ async def continue_multiple_media_question(
     settings: Settings,
     state: FSMContext,
     ticket_form_service: TicketFormService,
+    minecraft_service: MinecraftService,
     known_user: User | None = None,
 ) -> None:
     message = callback.message
@@ -555,7 +691,16 @@ async def continue_multiple_media_question(
 
     async with get_continue_media_lock(callback.from_user.id):
         user = await get_or_create_user(session, callback.from_user, known_user)
-        await handle_continue_multiple_media_question(callback, state, ticket_form_service, message, user, settings)
+        await handle_continue_multiple_media_question(
+            callback,
+            state,
+            ticket_form_service,
+            message,
+            user,
+            settings,
+            session=session,
+            minecraft_service=minecraft_service,
+        )
 
 
 async def handle_continue_multiple_media_question(
@@ -565,6 +710,9 @@ async def handle_continue_multiple_media_question(
     message: Message,
     user: User,
     settings: Settings,
+    *,
+    session: AsyncSession | None = None,
+    minecraft_service: MinecraftService | None = None,
 ) -> None:
     if await has_pending_media_group(callback.from_user.id):
         await callback.answer("Подождите, файлы ещё добавляются.", show_alert=True)
@@ -606,7 +754,18 @@ async def handle_continue_multiple_media_question(
 
         answers.append(build_skipped_answer(question))
 
-    await move_to_next_question_or_summary(message, state, form, answers, question_index + 1, user=user, settings=settings)
+    await move_to_next_question_or_summary(
+        message,
+        state,
+        form,
+        answers,
+        question_index + 1,
+        user=user,
+        settings=settings,
+        session=session,
+        ticket_form_service=ticket_form_service,
+        minecraft_service=minecraft_service,
+    )
     await callback.answer()
 
 
@@ -617,6 +776,7 @@ async def restart_form(
     settings: Settings,
     state: FSMContext,
     ticket_form_service: TicketFormService,
+    minecraft_service: MinecraftService,
     known_user: User | None = None,
 ) -> None:
     message = callback.message
@@ -634,7 +794,17 @@ async def restart_form(
     await state.set_state(TicketFlow.answering)
     await state.update_data(answers=[], question_index=0)
     user = await get_or_create_user(session, callback.from_user, known_user)
-    await ask_question_entry(message, state, form, 0, user, settings)
+    await ask_question_entry(
+        message,
+        state,
+        form,
+        0,
+        user,
+        settings,
+        session=session,
+        ticket_form_service=ticket_form_service,
+        minecraft_service=minecraft_service,
+    )
     await callback.answer()
 
 
@@ -786,6 +956,8 @@ async def submit_ticket(
             CALLBACK_SUBMIT_TICKET,
             CALLBACK_PROFILE_NICKNAME_YES,
             CALLBACK_PROFILE_NICKNAME_OTHER,
+            CALLBACK_PROFILE_NICKNAME_CHANGE_CONFIRM,
+            CALLBACK_PROFILE_NICKNAME_CHANGE_CANCEL,
             CALLBACK_MINECRAFT_LOOKUP_CONTINUE,
             CALLBACK_MINECRAFT_LOOKUP_OTHER,
         }
@@ -805,6 +977,7 @@ async def handle_private_message(
     settings: Settings,
     state: FSMContext,
     ticket_form_service: TicketFormService,
+    minecraft_service: MinecraftService,
     known_user: User | None = None,
     is_blocked_user: bool = False,
 ) -> None:
@@ -830,7 +1003,17 @@ async def handle_private_message(
         if not ticket_form_service.enabled:
             await message.answer(FORMS_DISABLED_TEXT, reply_markup=ReplyKeyboardRemove())
             return
-        await start_form_flow(message, state, selected_form, user, settings)
+        logger.info("Selected form_id=%s user_id=%s active_ticket_found=%s", selected_form.id, user.id, False)
+        await start_form_flow(
+            message,
+            state,
+            selected_form,
+            user,
+            settings,
+            session=session,
+            ticket_form_service=ticket_form_service,
+            minecraft_service=minecraft_service,
+        )
         return
 
     if ticket is None:
@@ -900,11 +1083,24 @@ async def move_to_next_question_or_summary(
     *,
     user: User | None = None,
     settings: Settings | None = None,
+    session: AsyncSession | None = None,
+    ticket_form_service: TicketFormService | None = None,
+    minecraft_service: MinecraftService | None = None,
 ) -> None:
     if next_question_index < len(form.questions):
         await state.update_data(answers=answers, question_index=next_question_index)
         if user is not None and settings is not None:
-            await ask_question_entry(message, state, form, next_question_index, user, settings)
+            await ask_question_entry(
+                message,
+                state,
+                form,
+                next_question_index,
+                user,
+                settings,
+                session=session,
+                ticket_form_service=ticket_form_service,
+                minecraft_service=minecraft_service,
+            )
         else:
             await ask_current_question(message, form, next_question_index)
         return
@@ -917,9 +1113,12 @@ async def move_to_next_question_or_summary(
     )
 
 
-async def ask_current_question(message: Message, form: TicketForm, question_index: int) -> None:
+async def ask_current_question(message: Message, form: TicketForm, question_index: int, prefix_text: str | None = None) -> None:
     question = form.questions[question_index]
-    await message.answer(build_question_text(question), reply_markup=get_question_reply_markup(question, question_index))
+    text = build_question_text(question)
+    if prefix_text:
+        text = f"{prefix_text.strip()}\n\n{text}"
+    await message.answer(text, reply_markup=get_question_reply_markup(question, question_index))
 
 
 async def ask_question_entry(
@@ -929,14 +1128,23 @@ async def ask_question_entry(
     question_index: int,
     user: User,
     settings: Settings,
+    *,
+    session: AsyncSession | None = None,
+    ticket_form_service: TicketFormService | None = None,
+    minecraft_service: MinecraftService | None = None,
 ) -> None:
     question = form.questions[question_index]
+    if should_auto_apply_minecraft_nickname(settings, user, question):
+        if session is not None and ticket_form_service is not None and minecraft_service is not None:
+            await apply_saved_minecraft_nickname(message, session, state, ticket_form_service, minecraft_service, user, settings)
+            return
+
     if should_offer_minecraft_nickname(settings, user, question):
         await state.set_state(TicketFlow.profile_choice)
         await state.update_data(question_index=question_index)
         await message.answer(
-            f"Использовать прошлый ник {user.minecraft_nickname}?",
-            reply_markup=minecraft_nickname_keyboard(),
+            build_profile_offer_text(settings, user, question),
+            reply_markup=minecraft_nickname_keyboard(change_label=get_profile_change_label(settings, question)),
         )
         return
 
@@ -944,11 +1152,70 @@ async def ask_question_entry(
     await ask_current_question(message, form, question_index)
 
 
-async def start_form_flow(message: Message, state: FSMContext, form: TicketForm, user: User, settings: Settings) -> None:
+async def start_form_flow(
+    message: Message,
+    state: FSMContext,
+    form: TicketForm,
+    user: User,
+    settings: Settings,
+    *,
+    session: AsyncSession | None = None,
+    ticket_form_service: TicketFormService | None = None,
+    minecraft_service: MinecraftService | None = None,
+) -> None:
     await state.set_state(TicketFlow.answering)
     await state.update_data(form_id=form.id, answers=[], question_index=0)
     await message.answer("Начинаем заполнение тикета.", reply_markup=ReplyKeyboardRemove())
-    await ask_question_entry(message, state, form, 0, user, settings)
+    await ask_question_entry(
+        message,
+        state,
+        form,
+        0,
+        user,
+        settings,
+        session=session,
+        ticket_form_service=ticket_form_service,
+        minecraft_service=minecraft_service,
+    )
+
+
+async def try_start_form_from_text_if_no_active_ticket(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+    state: FSMContext,
+    ticket_form_service: TicketFormService,
+    minecraft_service: MinecraftService,
+    user: User,
+) -> bool:
+    selected_form = get_form_by_button_text(ticket_form_service, message.text or "")
+    if selected_form is None:
+        return False
+
+    ticket_service = TicketService(session, settings.support_chat_id)
+    active_ticket = await ticket_service.get_open_ticket_by_user_id(user.id)
+    if active_ticket is not None:
+        logger.info("Selected form_id=%s user_id=%s active_ticket_found=%s", selected_form.id, user.id, True)
+        await state.clear()
+        await message.answer(OPEN_TICKET_EXISTS_TEXT, reply_markup=ReplyKeyboardRemove())
+        return True
+
+    logger.info("Selected form_id=%s user_id=%s active_ticket_found=%s", selected_form.id, user.id, False)
+    await state.clear()
+    if not ticket_form_service.enabled:
+        await message.answer(FORMS_DISABLED_TEXT, reply_markup=ReplyKeyboardRemove())
+        return True
+    await start_form_flow(
+        message,
+        state,
+        selected_form,
+        user,
+        settings,
+        session=session,
+        ticket_form_service=ticket_form_service,
+        minecraft_service=minecraft_service,
+    )
+    return True
 
 
 async def show_ticket_forms(message: Message, ticket_form_service: TicketFormService) -> None:
@@ -1499,11 +1766,95 @@ async def get_or_create_user(
 
 
 def should_offer_minecraft_nickname(settings: Settings, user: User, question: TicketQuestion) -> bool:
+    if not is_minecraft_nickname_question(question) or not str(user.minecraft_nickname or "").strip():
+        return False
+    if settings.minecraft_nickname_required_enabled:
+        return settings.minecraft_nickname_confirm_each_ticket
     return (
         settings.minecraft_nickname_autofill_enabled
+    )
+
+
+def should_auto_apply_minecraft_nickname(settings: Settings, user: User, question: TicketQuestion) -> bool:
+    return (
+        settings.minecraft_nickname_required_enabled
+        and not settings.minecraft_nickname_confirm_each_ticket
         and is_minecraft_nickname_question(question)
         and bool(str(user.minecraft_nickname or "").strip())
     )
+
+
+def get_profile_change_label(settings: Settings, question: TicketQuestion | None) -> str:
+    if question is not None and settings.minecraft_nickname_required_enabled and is_minecraft_nickname_question(question):
+        return "Изменить ник"
+    return "Ввести другой"
+
+
+def build_profile_offer_text(settings: Settings, user: User, question: TicketQuestion) -> str:
+    nickname = str(user.minecraft_nickname or "").strip()
+    if settings.minecraft_nickname_required_enabled and is_minecraft_nickname_question(question):
+        return f"Ваш игровой ник: {nickname}?"
+    return f"Использовать прошлый ник {nickname}?"
+
+
+async def begin_minecraft_nickname_change(
+    message: Message,
+    session: AsyncSession,
+    state: FSMContext,
+    ticket_form_service: TicketFormService,
+    user: User,
+    settings: Settings,
+) -> bool:
+    data = await state.get_data()
+    form = get_state_form(ticket_form_service, data)
+    question_index = int(data.get("question_index", 0))
+    if form is None or question_index >= len(form.questions):
+        await state.clear()
+        return False
+
+    question = form.questions[question_index]
+    if not is_minecraft_nickname_question(question):
+        await state.set_state(TicketFlow.answering)
+        await ask_current_question(message, form, question_index)
+        return True
+
+    cooldown_text = get_minecraft_nickname_cooldown_text(settings, user)
+    if cooldown_text:
+        await message.answer(cooldown_text, reply_markup=minecraft_nickname_keyboard(change_label="Изменить ник"))
+        return True
+
+    if settings.minecraft_nickname_required_enabled and settings.minecraft_nickname_lock_enabled and str(user.minecraft_nickname or "").strip():
+        await state.set_state(TicketFlow.profile_change_confirm)
+        await state.update_data(question_index=question_index)
+        await message.answer(
+            (
+                f"У вас уже закреплён игровой ник: {user.minecraft_nickname}.\n"
+                "Изменить ник можно только через подтверждение.\n\n"
+                "Продолжить смену ника?"
+            ),
+            reply_markup=minecraft_nickname_change_confirm_keyboard(),
+        )
+        return True
+
+    await state.set_state(TicketFlow.answering)
+    await state.update_data(changing_minecraft_nickname=True)
+    await ask_current_question(message, form, question_index, prefix_text="Введите новый игровой ник:")
+    return True
+
+
+def get_minecraft_nickname_cooldown_text(settings: Settings, user: User) -> str | None:
+    cooldown_hours = max(0, settings.minecraft_nickname_change_cooldown_hours)
+    if cooldown_hours <= 0 or user.minecraft_nickname_updated_at is None:
+        return None
+    available_at = user.minecraft_nickname_updated_at + timedelta(hours=cooldown_hours)
+    now = time.time()
+    try:
+        available_timestamp = available_at.timestamp()
+    except AttributeError:
+        return None
+    if now >= available_timestamp:
+        return None
+    return "Игровой ник можно будет изменить позже."
 
 
 async def apply_saved_minecraft_nickname(
@@ -1563,6 +1914,9 @@ async def apply_saved_minecraft_nickname(
         question_index + 1,
         user=user,
         settings=settings,
+        session=session,
+        ticket_form_service=ticket_form_service,
+        minecraft_service=minecraft_service,
     )
     return True
 
@@ -1651,6 +2005,7 @@ async def accept_pending_minecraft_lookup_answer(
     session: AsyncSession,
     state: FSMContext,
     ticket_form_service: TicketFormService,
+    minecraft_service: MinecraftService,
     user: User,
     settings: Settings,
 ) -> bool:
@@ -1674,6 +2029,9 @@ async def accept_pending_minecraft_lookup_answer(
         question_index + 1,
         user=user,
         settings=settings,
+        session=session,
+        ticket_form_service=ticket_form_service,
+        minecraft_service=minecraft_service,
     )
     return True
 

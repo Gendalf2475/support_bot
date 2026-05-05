@@ -8,10 +8,12 @@ from aiogram.enums import ChatMemberStatus, ChatType
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.bot.config import Settings
-from app.bot.database.models import Ticket, TicketStatus, User
+from app.bot.database.models import Ticket, TicketStatus, User, utcnow
 from app.bot.keyboards import (
     CALLBACK_CLOSE_PREFIX,
     CALLBACK_CLOSE_REASON_PREFIX,
@@ -21,7 +23,13 @@ from app.bot.keyboards import (
 )
 from app.bot.services.minecraft_service import MinecraftService, PlayerLookupResult
 from app.bot.services.ticket_form_service import TicketFormService
-from app.bot.services.ticket_service import CLOSE_REASONS, MANUAL_CLOSE_REASON_CODES, TicketService
+from app.bot.services.ticket_service import (
+    ACTIVE_TICKET_STATUSES,
+    CLOSE_REASONS,
+    FORCE_CLOSED_REASON,
+    MANUAL_CLOSE_REASON_CODES,
+    TicketService,
+)
 from app.bot.services.platform_router import PlatformRouter
 from app.bot.services.user_service import UserService
 
@@ -135,6 +143,82 @@ async def lookup_player(message: Message, settings: Settings, minecraft_service:
     await message.answer(format_player_lookup_result(result))
 
 
+@router.message(Command("debug_user"))
+async def debug_user(message: Message, bot: Bot, session: AsyncSession, settings: Settings) -> None:
+    if message.chat.id != settings.support_chat_id:
+        return
+    parsed = parse_platform_user_command(message.text or "")
+    if parsed is None:
+        await message.answer("Использование: /debug_user <platform> <platform_user_id>")
+        return
+
+    platform, platform_user_id = parsed
+    user = await UserService(session).get_by_platform_user_id(platform, platform_user_id)
+    if user is None:
+        await message.answer("Пользователь не найден.")
+        return
+
+    statement = (
+        select(Ticket)
+        .where(Ticket.user_id == user.id)
+        .order_by(Ticket.created_at.desc())
+        .limit(10)
+    )
+    tickets = list((await session.scalars(statement)).all())
+    await message.answer(format_debug_user_text(user, tickets))
+
+
+@router.message(Command("force_close_user"))
+async def force_close_user(
+    message: Message,
+    bot: Bot,
+    session: AsyncSession,
+    settings: Settings,
+    platform_router: PlatformRouter | None = None,
+) -> None:
+    if message.chat.id != settings.support_chat_id:
+        return
+    if message.from_user is None:
+        await message.answer("Не удалось определить администратора.")
+        return
+    parsed = parse_platform_user_command(message.text or "")
+    if parsed is None:
+        await message.answer("Использование: /force_close_user <platform> <platform_user_id>")
+        return
+
+    platform, platform_user_id = parsed
+    user = await UserService(session).get_by_platform_user_id(platform, platform_user_id)
+    if user is None:
+        await message.answer("Пользователь не найден.")
+        return
+
+    statement = (
+        select(Ticket)
+        .where(Ticket.user_id == user.id, Ticket.status.in_(ACTIVE_TICKET_STATUSES))
+        .options(selectinload(Ticket.answers))
+        .order_by(Ticket.created_at.desc())
+    )
+    tickets = list((await session.scalars(statement)).all())
+    now = utcnow()
+    for ticket in tickets:
+        logger.info("Force closing ticket id=%s current_status=%s", ticket.id, ticket.status.value)
+        ticket.status = TicketStatus.CLOSED
+        ticket.close_reason = FORCE_CLOSED_REASON
+        ticket.closed_at = now
+        ticket.closed_by_telegram_id = message.from_user.id
+        ticket.updated_at = now
+    if platform_router is not None:
+        platform_router.clear_user_state(user.platform, user.platform_user_id)
+
+    await session.flush()
+    await session.commit()
+    ticket_service = TicketService(session, settings.support_chat_id)
+    for ticket in tickets:
+        await ticket_service.update_ticket_card(bot, ticket, user, CLOSE_REASONS[FORCE_CLOSED_REASON].label)
+        await ticket_service.update_ticket_control_message(bot, ticket)
+    await message.answer(f"Активные тикеты пользователя закрыты: {len(tickets)}")
+
+
 @router.message(Command("close"))
 async def close_ticket_by_command(
     message: Message,
@@ -155,7 +239,8 @@ async def close_ticket_by_command(
     ticket_service = TicketService(session, settings.support_chat_id)
     ticket = await ticket_service.get_open_ticket_by_topic_id(message.message_thread_id)
     if ticket is None:
-        await message.answer("В этом топике нет открытого тикета.")
+        latest_ticket = await ticket_service.get_latest_ticket_by_topic_id(message.message_thread_id)
+        await message.answer("Тикет уже закрыт." if latest_ticket and latest_ticket.status not in ACTIVE_TICKET_STATUSES else "В этом топике нет открытого тикета.")
         return
 
     await prompt_close_reason(message, ticket, ticket_form_service)
@@ -181,9 +266,14 @@ async def close_ticket_by_keyboard(
         await message.answer("Закрывать тикеты могут только участники группы поддержки.")
         return
 
-    ticket = await TicketService(session, settings.support_chat_id).get_open_ticket_by_topic_id(message.message_thread_id)
+    ticket_service = TicketService(session, settings.support_chat_id)
+    ticket = await ticket_service.get_open_ticket_by_topic_id(message.message_thread_id)
     if ticket is None:
-        await message.answer("Нет открытого тикета для закрытия.", reply_markup=ReplyKeyboardRemove())
+        latest_ticket = await ticket_service.get_latest_ticket_by_topic_id(message.message_thread_id)
+        await message.answer(
+            "Тикет уже закрыт." if latest_ticket and latest_ticket.status in {TicketStatus.CLOSED, TicketStatus.CANCELLED} else "Нет открытого тикета для закрытия.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
         return
 
     await prompt_close_reason(message, ticket, ticket_form_service)
@@ -220,7 +310,11 @@ async def close_ticket_by_reason_keyboard(
     ticket_service = TicketService(session, settings.support_chat_id)
     ticket = await ticket_service.get_open_ticket_by_topic_id(message.message_thread_id)
     if ticket is None:
-        await message.answer("Нет открытого тикета для закрытия.", reply_markup=ReplyKeyboardRemove())
+        latest_ticket = await ticket_service.get_latest_ticket_by_topic_id(message.message_thread_id)
+        await message.answer(
+            "Тикет уже закрыт." if latest_ticket and latest_ticket.status in {TicketStatus.CLOSED, TicketStatus.CANCELLED} else "Нет открытого тикета для закрытия.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
         return
 
     try:
@@ -464,6 +558,48 @@ def parse_lookup_nickname(text: str) -> str | None:
     return nickname or None
 
 
+def parse_platform_user_command(text: str) -> tuple[str, str] | None:
+    parts = str(text or "").strip().split(maxsplit=2)
+    if len(parts) < 3:
+        return None
+    platform = parts[1].strip().lower()
+    platform_user_id = parts[2].strip()
+    if platform not in {"telegram", "discord", "vk"} or not platform_user_id:
+        return None
+    return platform, platform_user_id
+
+
+def format_debug_user_text(user: User, tickets: list[Ticket]) -> str:
+    lines = [
+        "🧪 Debug user",
+        "",
+        f"user.id: {user.id}",
+        f"platform: {user.platform}",
+        f"platform_user_id: {user.platform_user_id}",
+        f"username: {user.username or 'не указан'}",
+        f"full_name: {user.full_name or 'не указано'}",
+        f"topic_id: {user.topic_id}",
+        f"blocked: {user.blocked}",
+        f"minecraft_nickname: {user.minecraft_nickname or 'не указан'}",
+        f"minecraft_nickname_updated_at: {format_dt(user.minecraft_nickname_updated_at)}",
+        "",
+        "Последние тикеты:",
+    ]
+    if not tickets:
+        lines.append("нет")
+        return "\n".join(lines)
+
+    for ticket in tickets:
+        lines.append(
+            (
+                f"#{ticket.id} | {ticket.status.value} | {ticket.form_title} | "
+                f"close_reason={ticket.close_reason or 'нет'} | "
+                f"created_at={format_dt(ticket.created_at)} | closed_at={format_dt(ticket.closed_at)}"
+            )
+        )
+    return "\n".join(lines)
+
+
 def format_player_lookup_result(result: PlayerLookupResult) -> str:
     nickname = result.nickname or "не указан"
     lines = [
@@ -498,7 +634,7 @@ def validate_ticket_for_callback(ticket: Ticket | None, topic_id: int) -> str | 
         return "Тикет уже закрыт."
     if ticket.status == TicketStatus.CANCELLED:
         return "Тикет отменён."
-    if ticket.status not in {TicketStatus.OPEN, TicketStatus.IN_PROGRESS, TicketStatus.WAITING_USER}:
+    if ticket.status not in ACTIVE_TICKET_STATUSES:
         return "Тикет не открыт."
     return None
 

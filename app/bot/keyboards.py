@@ -14,6 +14,8 @@ CALLBACK_SKIP_QUESTION = "ticket_skip"
 CALLBACK_CONTINUE_MEDIA = "ticket_media_continue"
 CALLBACK_PROFILE_NICKNAME_YES = "ticket_profile_nickname_yes"
 CALLBACK_PROFILE_NICKNAME_OTHER = "ticket_profile_nickname_other"
+CALLBACK_PROFILE_NICKNAME_CHANGE_CONFIRM = "ticket_profile_nickname_change_confirm"
+CALLBACK_PROFILE_NICKNAME_CHANGE_CANCEL = "ticket_profile_nickname_change_cancel"
 CALLBACK_MINECRAFT_LOOKUP_CONTINUE = "ticket_minecraft_lookup_continue"
 CALLBACK_MINECRAFT_LOOKUP_OTHER = "ticket_minecraft_lookup_other"
 CALLBACK_FORM_PREFIX = "ticket_form:"
@@ -77,11 +79,20 @@ def ticket_summary_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def minecraft_nickname_keyboard() -> InlineKeyboardMarkup:
+def minecraft_nickname_keyboard(*, change_label: str = "Ввести другой") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="Да", callback_data=CALLBACK_PROFILE_NICKNAME_YES)],
-            [InlineKeyboardButton(text="Ввести другой", callback_data=CALLBACK_PROFILE_NICKNAME_OTHER)],
+            [InlineKeyboardButton(text=change_label, callback_data=CALLBACK_PROFILE_NICKNAME_OTHER)],
+        ]
+    )
+
+
+def minecraft_nickname_change_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Да, изменить", callback_data=CALLBACK_PROFILE_NICKNAME_CHANGE_CONFIRM)],
+            [InlineKeyboardButton(text="Отмена", callback_data=CALLBACK_PROFILE_NICKNAME_CHANGE_CANCEL)],
         ]
     )
 

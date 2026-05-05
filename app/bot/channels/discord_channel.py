@@ -133,10 +133,29 @@ class DiscordChannel:
         user: Any,
         question_index: int,
         nickname: str,
+        *,
+        change_label: str = "Ввести другой",
+        text: str | None = None,
     ) -> SentMessageRef | None:
         discord_ui = self._discord_ui()
-        embed = discord_ui.build_minecraft_nickname_embed(nickname)
+        embed = discord_ui.build_minecraft_nickname_embed(nickname, text=text)
         view = discord_ui.MinecraftNicknameView(
+            question_index=question_index,
+            owner_id=int(user.platform_user_id),
+            on_action=self._handle_action,
+            change_label=change_label,
+        )
+        return await self._send_discord_dm(user.platform_user_id, embed=embed, view=view)
+
+    async def send_minecraft_nickname_change_confirmation(
+        self,
+        user: Any,
+        question_index: int,
+        nickname: str,
+    ) -> SentMessageRef | None:
+        discord_ui = self._discord_ui()
+        embed = discord_ui.build_minecraft_nickname_change_confirmation_embed(nickname)
+        view = discord_ui.MinecraftNicknameChangeConfirmView(
             question_index=question_index,
             owner_id=int(user.platform_user_id),
             on_action=self._handle_action,

@@ -262,9 +262,13 @@ class TicketFormatter:
     ) -> list[str]:
         answers_by_question = cls._group_mapping_answers(answers)
         blocks: list[str] = []
-        for number, question in enumerate(questions, start=1):
+        number = 1
+        for question in questions:
+            if get_minecraft_profile_field(question) == PROFILE_FIELD_MINECRAFT_NICKNAME:
+                continue
             question_answers = answers_by_question.get(question.id, [])
             blocks.append(cls._format_answer_block(number, question.text, question_answers))
+            number += 1
         return blocks
 
     @classmethod
@@ -272,6 +276,8 @@ class TicketFormatter:
         grouped: dict[str, list[TicketAnswer]] = {}
         ordered_questions: list[tuple[str, str]] = []
         for answer in sorted(answers, key=lambda item: item.id):
+            if answer.profile_field == PROFILE_FIELD_MINECRAFT_NICKNAME:
+                continue
             if answer.question_id not in grouped:
                 grouped[answer.question_id] = []
                 ordered_questions.append((answer.question_id, answer.question_text))
@@ -311,6 +317,7 @@ class TicketFormatter:
                 items.append(
                     {
                         "label": cls._minecraft_lookup_label(profile_field, question.text),
+                        "profile_field": profile_field,
                         "nickname": str(lookup.get("nickname") or nickname),
                         "exists": lookup.get("exists"),
                         "uuid": lookup.get("uuid"),
@@ -342,6 +349,7 @@ class TicketFormatter:
             items.append(
                 {
                     "label": cls._minecraft_lookup_label(profile_field, answer.question_text),
+                    "profile_field": profile_field,
                     "nickname": nickname,
                     "exists": answer.minecraft_lookup_exists,
                     "uuid": answer.minecraft_lookup_uuid,
@@ -358,7 +366,8 @@ class TicketFormatter:
             return None
         if len(items) == 1:
             item = items[0]
-            return "\n".join(["🎮 Игрок", "", *cls._format_minecraft_lookup_lines(item, bullet=False)])
+            title = "🎮 Игровой ник" if item.get("profile_field") == PROFILE_FIELD_MINECRAFT_NICKNAME else "🎯 Ник нарушителя"
+            return "\n".join([title, "", *cls._format_minecraft_lookup_lines(item, bullet=False)])
 
         lines = ["🎮 Проверка игроков"]
         for item in items:
@@ -398,9 +407,9 @@ class TicketFormatter:
     @staticmethod
     def _minecraft_lookup_label(profile_field: str | None, fallback_text: str) -> str:
         if profile_field == PROFILE_FIELD_MINECRAFT_NICKNAME:
-            return "Ваш ник"
+            return "🎮 Игровой ник пользователя"
         if profile_field == PROFILE_FIELD_MINECRAFT_TARGET_NICKNAME:
-            return "Ник нарушителя"
+            return "🎯 Целевой игрок / нарушитель"
         return TicketFormatter._clean_label(fallback_text)
 
     @classmethod

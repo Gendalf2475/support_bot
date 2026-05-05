@@ -161,8 +161,10 @@ class UserService:
         normalized = str(nickname or "").strip()
         if not normalized:
             return
+        now = utcnow()
         user.minecraft_nickname = normalized
-        user.updated_at = utcnow()
+        user.minecraft_nickname_updated_at = now
+        user.updated_at = now
         await self.session.flush()
 
     @staticmethod

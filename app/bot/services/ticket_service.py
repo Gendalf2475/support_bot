@@ -16,7 +16,14 @@ from sqlalchemy.orm import selectinload
 from app.bot.database.models import Platform, Ticket, TicketAnswer, TicketAnswerMedia, TicketStatus, User, utcnow
 from app.bot.services.platform_router import PlatformRouter
 from app.bot.services.ticket_formatter import TicketFormatter
-from app.bot.services.ticket_form_service import TicketCloseReason, TicketForm, get_minecraft_profile_field
+from app.bot.services.ticket_form_service import (
+    PROFILE_FIELD_MINECRAFT_NICKNAME,
+    PROFILE_FIELD_MINECRAFT_TARGET_NICKNAME,
+    TicketCloseReason,
+    TicketForm,
+    TicketQuestion,
+    get_minecraft_profile_field,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -50,10 +57,19 @@ CLOSE_REASONS: dict[str, CloseReason] = {
         "Автоматически: нет ответа от пользователя",
         "Автоматически: нет ответа от пользователя",
     ),
+    "force_closed_by_admin": CloseReason(
+        "force_closed_by_admin",
+        "Аварийно закрыт администратором",
+        "Аварийно закрыт администратором",
+        user_message="✅ Ваш тикет был закрыт администрацией.",
+        show_to_user=True,
+    ),
 }
 MANUAL_CLOSE_REASON_CODES = ("resolved", "no_user_response", "duplicate", "rule_violation", "other")
 AUTO_NO_USER_RESPONSE_REASON = "auto_no_user_response"
+FORCE_CLOSED_REASON = "force_closed_by_admin"
 ACTIVE_TICKET_STATUSES = (TicketStatus.OPEN, TicketStatus.IN_PROGRESS, TicketStatus.WAITING_USER)
+INACTIVE_TICKET_STATUSES = (TicketStatus.CLOSED, TicketStatus.CANCELLED)
 SUPPORT_WAITING_STATUSES = (TicketStatus.OPEN, TicketStatus.IN_PROGRESS)
 DEFAULT_TICKET_SUCCESS_TEXT = "✅ Тикет отправлен в поддержку.\nОтвет придёт сюда."
 USER_REPLY_REMINDER_TEXT = "⏳ Поддержка ожидает ваш ответ.\n\nПожалуйста, напишите сообщение сюда."
@@ -63,6 +79,18 @@ AUTO_CLOSE_WARNING_TEXT = "⏰ Ваш тикет будет закрыт чер�
 class SafeFormatDict(dict[str, Any]):
     def __missing__(self, key: str) -> str:
         return "{" + key + "}"
+
+
+@dataclass(frozen=True)
+class CloseTicketResult:
+    ticket: Ticket
+    closed: bool
+    already_closed: bool
+    reason_id: str
+    reason_title: str
+
+    def __bool__(self) -> bool:
+        return self.closed
 
 
 class TicketService:
@@ -78,7 +106,9 @@ class TicketService:
             .order_by(Ticket.created_at.desc())
             .limit(1)
         )
-        return await self.session.scalar(statement)
+        ticket = await self.session.scalar(statement)
+        await self._log_active_ticket_lookup(user_id=user_id, ticket=ticket)
+        return ticket
 
     async def get_open_ticket_by_topic_id(self, topic_id: int) -> Ticket | None:
         statement = (
@@ -88,7 +118,63 @@ class TicketService:
             .order_by(Ticket.created_at.desc())
             .limit(1)
         )
+        ticket = await self.session.scalar(statement)
+        if ticket is not None:
+            logger.info(
+                "Active ticket lookup by topic topic_id=%s found ticket_id=%s ticket_status=%s",
+                topic_id,
+                ticket.id,
+                ticket.status.value,
+            )
+        return ticket
+
+    async def get_latest_ticket_by_topic_id(self, topic_id: int) -> Ticket | None:
+        statement = (
+            select(Ticket)
+            .where(Ticket.topic_id == topic_id)
+            .options(selectinload(Ticket.answers).selectinload(TicketAnswer.media_files))
+            .order_by(Ticket.created_at.desc())
+            .limit(1)
+        )
         return await self.session.scalar(statement)
+
+    async def _log_active_ticket_lookup(self, *, user_id: int, ticket: Ticket | None) -> None:
+        user = await self.session.get(User, user_id)
+        if ticket is not None:
+            logger.info(
+                "Active ticket lookup user_id=%s platform=%s platform_user_id=%s found ticket_id=%s ticket_status=%s",
+                user_id,
+                user.platform if user else None,
+                user.platform_user_id if user else None,
+                ticket.id,
+                ticket.status.value,
+            )
+            return
+
+        latest_statement = (
+            select(Ticket)
+            .where(Ticket.user_id == user_id)
+            .order_by(Ticket.created_at.desc())
+            .limit(1)
+        )
+        latest_ticket = await self.session.scalar(latest_statement)
+        if latest_ticket is not None and latest_ticket.status in INACTIVE_TICKET_STATUSES:
+            logger.info(
+                "Ignored inactive ticket id=%s status=%s user_id=%s platform=%s platform_user_id=%s",
+                latest_ticket.id,
+                latest_ticket.status.value,
+                user_id,
+                user.platform if user else None,
+                user.platform_user_id if user else None,
+            )
+            return
+
+        logger.info(
+            "Active ticket lookup user_id=%s platform=%s platform_user_id=%s found no active ticket",
+            user_id,
+            user.platform if user else None,
+            user.platform_user_id if user else None,
+        )
 
     async def get_ticket_by_id(self, ticket_id: int) -> Ticket | None:
         statement = (
@@ -208,22 +294,38 @@ class TicketService:
         auto_close_after_days: int | None = None,
         ticket_forms: list[TicketForm] | None = None,
         platform_router: PlatformRouter | None = None,
-    ) -> bool:
-        if ticket.status in {TicketStatus.CLOSED, TicketStatus.CANCELLED}:
-            return False
+    ) -> CloseTicketResult:
+        fresh_ticket = await self.get_ticket_by_id(ticket.id)
+        if fresh_ticket is None:
+            raise ValueError(f"Ticket not found: {ticket.id}")
 
-        close_reason = self.resolve_close_reason(ticket, reason, ticket_forms)
+        logger.info("Closing ticket id=%s current_status=%s", fresh_ticket.id, fresh_ticket.status.value)
+        if fresh_ticket.status in INACTIVE_TICKET_STATUSES:
+            reason_title = self.get_close_reason_label(fresh_ticket.close_reason or reason)
+            logger.info("Ticket already closed id=%s status=%s", fresh_ticket.id, fresh_ticket.status.value)
+            return CloseTicketResult(
+                ticket=fresh_ticket,
+                closed=False,
+                already_closed=True,
+                reason_id=fresh_ticket.close_reason or reason,
+                reason_title=reason_title,
+            )
+
+        close_reason = self.resolve_close_reason(fresh_ticket, reason, ticket_forms)
         if close_reason is None:
             raise ValueError(f"Unknown ticket close reason: {reason}")
 
-        ticket.status = TicketStatus.CLOSED
-        ticket.close_reason = reason
-        ticket.closed_at = utcnow()
-        ticket.closed_by_telegram_id = closed_by_telegram_id
+        now = utcnow()
+        fresh_ticket.status = TicketStatus.CLOSED
+        fresh_ticket.close_reason = reason
+        fresh_ticket.closed_at = now
+        fresh_ticket.closed_by_telegram_id = closed_by_telegram_id
+        fresh_ticket.updated_at = now
         await self.session.flush()
+        await self.session.commit()
 
-        user = await self.session.get(User, ticket.user_id)
-        topic_id = ticket.topic_id or (user.topic_id if user else None)
+        user = await self.session.get(User, fresh_ticket.user_id)
+        topic_id = fresh_ticket.topic_id or (user.topic_id if user else None)
         topic_text = self.build_support_close_text(reason, auto_close_after_days, close_reason)
         if topic_id:
             try:
@@ -234,9 +336,11 @@ class TicketService:
                     reply_markup=ReplyKeyboardRemove(),
                 )
             except TelegramAPIError as error:
-                logger.error("Failed to send ticket closed notice ticket_id=%s topic_id=%s: %s", ticket.id, topic_id, error)
+                logger.error("Failed to send ticket closed notice ticket_id=%s topic_id=%s: %s", fresh_ticket.id, topic_id, error)
 
         if user:
+            if platform_router is not None:
+                platform_router.clear_user_state(user.platform, user.platform_user_id)
             notification_sent = False
             if platform_router is not None:
                 sent = await platform_router.send_ticket_closed(
@@ -261,22 +365,29 @@ class TicketService:
                     )
                     notification_sent = True
                 except TelegramAPIError as error:
-                    logger.error("Failed to notify user about closed ticket ticket_id=%s telegram_id=%s: %s", ticket.id, user.telegram_id, error)
+                    logger.error("Failed to notify user about closed ticket ticket_id=%s telegram_id=%s: %s", fresh_ticket.id, user.telegram_id, error)
 
             if not notification_sent and topic_id:
                 await self.notify_support_about_user_notification_error(bot, topic_id)
 
         if user:
-            await self.update_ticket_card(bot, ticket, user, close_reason.label)
-        await self.update_ticket_control_message(bot, ticket)
+            await self.update_ticket_card(bot, fresh_ticket, user, get_close_reason_title(close_reason))
+        await self.update_ticket_control_message(bot, fresh_ticket)
 
         logger.info(
-            "Closed ticket id=%s by telegram_id=%s reason=%s",
-            ticket.id,
-            closed_by_telegram_id,
+            "Ticket closed id=%s reason_id=%s reason_title=%s by telegram_id=%s",
+            fresh_ticket.id,
             reason,
+            get_close_reason_title(close_reason),
+            closed_by_telegram_id,
         )
-        return True
+        return CloseTicketResult(
+            ticket=fresh_ticket,
+            closed=True,
+            already_closed=False,
+            reason_id=reason,
+            reason_title=get_close_reason_title(close_reason),
+        )
 
     async def send_due_reminders(
         self,
@@ -608,7 +719,7 @@ class TicketService:
         lines: list[str] = []
         for question in form.questions:
             answer = answer_by_question.get(question.id)
-            label = question.text.strip().rstrip(":")
+            label = TicketService.get_preview_question_label(question)
             lines.append(f"{label}:")
 
             if answer is None:
@@ -628,6 +739,15 @@ class TicketService:
         if lines and lines[-1] == "":
             lines.pop()
         return lines
+
+    @staticmethod
+    def get_preview_question_label(question: TicketQuestion) -> str:
+        profile_field = get_minecraft_profile_field(question)
+        if profile_field == PROFILE_FIELD_MINECRAFT_NICKNAME:
+            return "Игровой ник"
+        if profile_field == PROFILE_FIELD_MINECRAFT_TARGET_NICKNAME:
+            return "Ник нарушителя"
+        return question.text.strip().rstrip(":")
 
     @staticmethod
     def extract_media_files(answer: dict[str, Any]) -> list[dict[str, Any]]:
@@ -677,7 +797,7 @@ class TicketService:
         close_reason = CLOSE_REASONS.get(reason)
         if close_reason is None:
             return reason
-        return close_reason.label
+        return get_close_reason_title(close_reason)
 
     @staticmethod
     def fallback_close_reasons() -> list[CloseReason]:
@@ -702,8 +822,8 @@ class TicketService:
         reason: str,
         ticket_forms: list[TicketForm] | None = None,
     ) -> TicketCloseReason | CloseReason | None:
-        if reason == AUTO_NO_USER_RESPONSE_REASON:
-            return CLOSE_REASONS[AUTO_NO_USER_RESPONSE_REASON]
+        if reason in {AUTO_NO_USER_RESPONSE_REASON, FORCE_CLOSED_REASON}:
+            return CLOSE_REASONS[reason]
         return next((close_reason for close_reason in TicketService.get_form_close_reasons(ticket, ticket_forms) if close_reason.id == reason), None)
 
     @staticmethod
@@ -719,7 +839,7 @@ class TicketService:
                 f"Причина: пользователь не отвечал больше {days} дней."
             )
 
-        label = close_reason.title if close_reason is not None else TicketService.get_close_reason_label(reason)
+        label = get_close_reason_title(close_reason) if close_reason is not None else TicketService.get_close_reason_label(reason)
         return f"✅ Тикет закрыт.\nПричина: {label}."
 
     @staticmethod
@@ -739,7 +859,7 @@ class TicketService:
         if close_reason is not None and close_reason.show_to_user and close_reason.user_message:
             return close_reason.user_message
 
-        label = close_reason.title if close_reason is not None else TicketService.get_close_reason_label(reason)
+        label = get_close_reason_title(close_reason) if close_reason is not None else TicketService.get_close_reason_label(reason)
         return (
             "✅ Ваш тикет был закрыт администрацией.\n"
             f"Причина: {label}.\n\n"
@@ -778,6 +898,10 @@ class TicketService:
             )
         except TelegramAPIError as notify_error:
             logger.error("Failed to notify support about close notification error topic_id=%s: %s", topic_id, notify_error)
+
+
+def get_close_reason_title(reason: TicketCloseReason | CloseReason) -> str:
+    return reason.title or reason.button_text or reason.id
 
     @staticmethod
     def limit_text(text: str) -> str:

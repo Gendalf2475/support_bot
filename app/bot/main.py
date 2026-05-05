@@ -42,7 +42,10 @@ async def main() -> None:
     dispatcher = Dispatcher()
 
     sessionmaker = create_sessionmaker(settings.database_url)
-    ticket_form_service = TicketFormService(settings.ticket_forms_path)
+    ticket_form_service = TicketFormService(
+        settings.ticket_forms_path,
+        global_questions_enabled=settings.minecraft_nickname_required_enabled,
+    )
     minecraft_service = MinecraftService(settings)
     platform_router = PlatformRouter()
     external_processor = ExternalSupportProcessor(bot, sessionmaker, settings, ticket_form_service, platform_router, minecraft_service)

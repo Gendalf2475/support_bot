@@ -7,7 +7,14 @@ from typing import Any
 
 import discord
 
-from app.bot.services.ticket_form_service import ANSWER_TYPE_MEDIA, TicketForm, TicketQuestion
+from app.bot.services.ticket_form_service import (
+    ANSWER_TYPE_MEDIA,
+    PROFILE_FIELD_MINECRAFT_NICKNAME,
+    PROFILE_FIELD_MINECRAFT_TARGET_NICKNAME,
+    TicketForm,
+    TicketQuestion,
+    get_minecraft_profile_field,
+)
 from app.bot.services.ticket_service import TicketService
 
 
@@ -133,7 +140,7 @@ class MediaContinueView(discord.ui.View):
 
 
 class MinecraftNicknameView(discord.ui.View):
-    def __init__(self, question_index: int, owner_id: int, on_action: ActionCallback) -> None:
+    def __init__(self, question_index: int, owner_id: int, on_action: ActionCallback, *, change_label: str = "Ввести другой") -> None:
         super().__init__(timeout=None)
         self.owner_id = owner_id
         self.on_action = on_action
@@ -147,7 +154,7 @@ class MinecraftNicknameView(discord.ui.View):
         self.add_item(yes_button)
 
         other_button = discord.ui.Button(
-            label="Ввести другой",
+            label=change_label,
             style=discord.ButtonStyle.secondary,
             custom_id=f"majure_profile_nickname_other:{question_index}",
         )
@@ -165,6 +172,41 @@ class MinecraftNicknameView(discord.ui.View):
 
     async def _other_callback(self, interaction: discord.Interaction) -> None:
         await self.on_action(interaction, "profile_other", _parse_custom_index(interaction), None)
+
+
+class MinecraftNicknameChangeConfirmView(discord.ui.View):
+    def __init__(self, question_index: int, owner_id: int, on_action: ActionCallback) -> None:
+        super().__init__(timeout=None)
+        self.owner_id = owner_id
+        self.on_action = on_action
+
+        confirm_button = discord.ui.Button(
+            label="Да, изменить",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"majure_profile_nickname_change_confirm:{question_index}",
+        )
+        confirm_button.callback = self._confirm_callback
+        self.add_item(confirm_button)
+
+        cancel_button = discord.ui.Button(
+            label="Отмена",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"majure_profile_nickname_change_cancel:{question_index}",
+        )
+        cancel_button.callback = self._cancel_callback
+        self.add_item(cancel_button)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner_id:
+            return True
+        await send_interaction_notice(interaction, "Эта кнопка доступна только автору обращения.")
+        return False
+
+    async def _confirm_callback(self, interaction: discord.Interaction) -> None:
+        await self.on_action(interaction, "profile_change_confirm", _parse_custom_index(interaction), None)
+
+    async def _cancel_callback(self, interaction: discord.Interaction) -> None:
+        await self.on_action(interaction, "profile_change_cancel", _parse_custom_index(interaction), None)
 
 
 class MinecraftLookupConfirmView(discord.ui.View):
@@ -328,11 +370,23 @@ def build_media_continue_embed(
     )
 
 
-def build_minecraft_nickname_embed(nickname: str) -> discord.Embed:
+def build_minecraft_nickname_embed(nickname: str, *, text: str | None = None) -> discord.Embed:
     return discord.Embed(
         title="Игровой ник",
-        description=f"Использовать прошлый ник {nickname}?",
+        description=text or f"Использовать прошлый ник {nickname}?",
         color=discord.Color.blurple(),
+    )
+
+
+def build_minecraft_nickname_change_confirmation_embed(nickname: str) -> discord.Embed:
+    return discord.Embed(
+        title="Смена игрового ника",
+        description=(
+            f"У вас уже закреплён игровой ник: {nickname}.\n"
+            "Изменить ник можно только через подтверждение.\n\n"
+            "Продолжить смену ника?"
+        ),
+        color=discord.Color.gold(),
     )
 
 
@@ -359,7 +413,7 @@ def build_ticket_preview_embed(form: TicketForm, answers: list[dict[str, Any]]) 
     for question_number, question in enumerate(form.questions[:max_question_fields], start=1):
         answer = answers_by_question.get(question.id)
         embed.add_field(
-            name=_limit_field_name(f"{question_number}. {question.text.strip().rstrip(':')}"),
+            name=_limit_field_name(f"{question_number}. {_preview_question_label(question)}"),
             value=_format_preview_answer(answer),
             inline=False,
         )
@@ -412,6 +466,15 @@ def build_form_select_options(forms: list[TicketForm]) -> list[discord.SelectOpt
             option_kwargs["emoji"] = emoji
         options.append(discord.SelectOption(**option_kwargs))
     return options
+
+
+def _preview_question_label(question: TicketQuestion) -> str:
+    profile_field = get_minecraft_profile_field(question)
+    if profile_field == PROFILE_FIELD_MINECRAFT_NICKNAME:
+        return "Игровой ник"
+    if profile_field == PROFILE_FIELD_MINECRAFT_TARGET_NICKNAME:
+        return "Ник нарушителя"
+    return question.text.strip().rstrip(":")
 
 
 async def send_interaction_notice(interaction: discord.Interaction, text: str) -> None:
