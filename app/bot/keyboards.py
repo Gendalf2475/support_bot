@@ -97,6 +97,15 @@ def ticket_summary_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def ticket_preview_error_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Заполнить заново", callback_data=CALLBACK_RESTART_TICKET)],
+            [InlineKeyboardButton(text="Отмена", callback_data=CALLBACK_CANCEL_TICKET)],
+        ]
+    )
+
+
 def minecraft_nickname_keyboard(*, change_label: str = "Ввести другой") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[

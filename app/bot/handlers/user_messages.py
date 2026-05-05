@@ -49,6 +49,7 @@ from app.bot.keyboards import (
     open_ticket_keyboard,
     question_keyboard,
     support_close_ticket_keyboard,
+    ticket_preview_error_keyboard,
     ticket_forms_keyboard,
     ticket_forms_reply_keyboard,
     ticket_summary_keyboard,
@@ -1305,10 +1306,17 @@ async def move_to_next_question_or_summary(
         current_question_index=None,
         current_question_id=None,
     )
-    await message.answer(
-        TicketService.build_user_summary_text(form, answers),
-        reply_markup=ticket_summary_keyboard(),
-    )
+    try:
+        summary_text = TicketService.build_user_summary_text(form, answers)
+    except Exception as error:
+        logger.exception("Failed to build ticket preview form_id=%s answers_count=%s: %s", form.id, len(answers), error)
+        await message.answer(
+            "Не удалось подготовить предварительный просмотр тикета. Попробуйте ещё раз или начните заново.",
+            reply_markup=ticket_preview_error_keyboard(),
+        )
+        return
+
+    await message.answer(summary_text, reply_markup=ticket_summary_keyboard())
 
 
 async def ask_current_question(message: Message, form: TicketForm, question_index: int, prefix_text: str | None = None) -> None:

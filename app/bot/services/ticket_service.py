@@ -681,6 +681,7 @@ class TicketService:
 
     @staticmethod
     def build_user_summary_text(form: TicketForm, answers: list[dict[str, Any]]) -> str:
+        logger.debug("building user summary form_id=%s answers_count=%s", form.id, len(answers))
         lines = [
             "Проверьте данные тикета:",
             "",
@@ -689,7 +690,15 @@ class TicketService:
         ]
         lines.extend(TicketService._format_answer_lines(form, answers, for_admin=False))
         lines.extend(["", "Отправить тикет?"])
-        return TicketService.limit_text("\n".join(lines))
+        text = "\n".join(lines)
+        limited_text = TicketService.limit_text(text, limit=4000)
+        logger.debug(
+            "building user summary form_id=%s summary length=%s summary truncated=%s",
+            form.id,
+            len(text),
+            limited_text != text,
+        )
+        return limited_text
 
     @staticmethod
     def build_admin_ticket_text(form: TicketForm, user: User, answers: list[dict[str, Any]]) -> str:
@@ -711,7 +720,7 @@ class TicketService:
             "",
         ]
         lines.extend(TicketService._format_answer_lines(form, answers, for_admin=True))
-        return TicketService.limit_text("\n".join(lines))
+        return TicketService.limit_text("\n".join(lines), limit=4000)
 
     @staticmethod
     def _format_answer_lines(form: TicketForm, answers: list[dict[str, Any]], for_admin: bool) -> list[str]:
@@ -850,20 +859,24 @@ class TicketService:
     ) -> str:
         if reason == AUTO_NO_USER_RESPONSE_REASON:
             days = auto_close_after_days or 0
-            return (
-                "✅ Ваш тикет был автоматически закрыт, так как в нём не было активности "
-                f"больше {days} дней.\n"
-                "Если вопрос ещё актуален, выберите тип обращения ниже."
+            return TicketService.limit_text(
+                (
+                    "✅ Ваш тикет был автоматически закрыт, так как в нём не было активности "
+                    f"больше {days} дней.\n"
+                    "Если вопрос ещё актуален, выберите тип обращения ниже."
+                ),
+                limit=4000,
             )
 
         if close_reason is not None and close_reason.show_to_user and close_reason.user_message:
-            return close_reason.user_message
+            return TicketService.limit_text(close_reason.user_message, limit=4000)
 
         label = get_close_reason_title(close_reason) if close_reason is not None else TicketService.get_close_reason_label(reason)
-        return (
+        return TicketService.limit_text(
             "✅ Ваш тикет был закрыт администрацией.\n"
             f"Причина: {label}.\n\n"
-            "Если у вас появится новый вопрос, выберите тип обращения ниже."
+            "Если у вас появится новый вопрос, выберите тип обращения ниже.",
+            limit=4000,
         )
 
     @staticmethod
@@ -877,10 +890,24 @@ class TicketService:
             }
         )
         try:
-            return template.format_map(values)
+            return TicketService.limit_text(template.format_map(values), limit=4000)
         except Exception as error:
             logger.error("Failed to render success_text form_id=%s ticket_id=%s: %s", form.id, ticket.id, error)
-            return template
+            return TicketService.limit_text(template, limit=4000)
+
+    @staticmethod
+    def limit_text(text: str | None, limit: int = 4000) -> str:
+        if text is None:
+            return ""
+        normalized = str(text)
+        if limit <= 0:
+            return ""
+        if len(normalized) <= limit:
+            return normalized
+        suffix = "\n\n…"
+        if limit <= len(suffix):
+            return normalized[:limit]
+        return normalized[: limit - len(suffix)].rstrip() + suffix
 
     async def notify_support_about_user_notification_error(
         self,
@@ -902,9 +929,3 @@ class TicketService:
 
 def get_close_reason_title(reason: TicketCloseReason | CloseReason) -> str:
     return reason.title or reason.button_text or reason.id
-
-    @staticmethod
-    def limit_text(text: str) -> str:
-        if len(text) <= 4096:
-            return text
-        return text[:4000] + "\n\n...текст обрезан, потому что Telegram ограничивает длину сообщения."

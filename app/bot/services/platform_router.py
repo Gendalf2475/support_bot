@@ -256,7 +256,7 @@ class PlatformRouter:
                     return sent
             except Exception as error:
                 logger.exception("Failed to send platform ticket preview platform=%s user_id=%s: %s", user.platform, user.id, error)
-        text = f"{build_external_preview_text(form, answers)}\n\nНапишите: Отправить, Заново или Отмена."
+        text = limit_platform_text(f"{build_external_preview_text(form, answers)}\n\nНапишите: Отправить, Заново или Отмена.")
         return await self.send_text(user, text, telegram_bot=telegram_bot)
 
     async def send_ticket_sent(
@@ -443,6 +443,16 @@ def build_external_preview_text(form: TicketForm, answers: list[dict[str, Any]])
         lines.append("")
     lines.append("Отправить тикет?")
     return "\n".join(lines)
+
+
+def limit_platform_text(text: str | None, limit: int = 4000) -> str:
+    normalized = str(text or "")
+    if len(normalized) <= limit:
+        return normalized
+    suffix = "\n\n…"
+    if limit <= len(suffix):
+        return normalized[:limit]
+    return normalized[: limit - len(suffix)].rstrip() + suffix
 
 
 def build_preview_question_label(question: TicketQuestion) -> str:

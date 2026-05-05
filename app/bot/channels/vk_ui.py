@@ -201,7 +201,7 @@ def build_preview_text(form: TicketForm, answers: list[dict[str, Any]]) -> str:
         lines.append(_format_preview_answer(answer))
         lines.append("")
     lines.append("Отправить тикет?")
-    return "\n".join(lines)
+    return _limit_text("\n".join(lines), 4000)
 
 
 def _preview_question_label(question: TicketQuestion) -> str:
@@ -217,7 +217,7 @@ def build_ticket_sent_text(ticket_id: int | None = None, success_text: str | Non
     text = success_text or "✅ Тикет отправлен в поддержку.\nОтвет придёт сюда."
     if ticket_id is not None and success_text is None:
         text = f"{text}\n\nТикет: #{ticket_id}"
-    return text
+    return _limit_text(text, 4000)
 
 
 def _format_preview_answer(answer: dict[str, Any] | None) -> str:
@@ -227,6 +227,16 @@ def _format_preview_answer(answer: dict[str, Any] | None) -> str:
         media_count = len(TicketService.extract_media_files(answer))
         return f"📎 Медиафайлов: {media_count}" if media_count else "— Пропущено"
     return str(answer.get("answer_text") or "не указано")
+
+
+def _limit_text(text: str | None, limit: int) -> str:
+    normalized = str(text or "")
+    if len(normalized) <= limit:
+        return normalized
+    suffix = "\n\n…"
+    if limit <= len(suffix):
+        return normalized[:limit]
+    return normalized[: limit - len(suffix)].rstrip() + suffix
 
 
 def _keyboard(rows: list[list[dict[str, Any]]]) -> str:

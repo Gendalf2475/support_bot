@@ -445,7 +445,7 @@ def build_ticket_sent_embed(ticket_id: int | None = None, success_text: str | No
         description = f"{description}\n\nТикет: #{ticket_id}"
     return discord.Embed(
         title="✅ Тикет отправлен",
-        description=description,
+        description=_limit_text(description, 4096),
         color=discord.Color.green(),
     )
 
@@ -456,7 +456,7 @@ def build_closed_ticket_embed(text: str) -> discord.Embed:
         description = description[2:].strip()
     return discord.Embed(
         title="✅ Тикет закрыт",
-        description=description,
+        description=_limit_text(description, 4096),
         color=discord.Color.green(),
     )
 
