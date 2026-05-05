@@ -59,6 +59,14 @@ VK_GROUP_ID=
 VK_LONGPOLL_ENABLED=true
 
 MINECRAFT_NICKNAME_AUTOFILL_ENABLED=true
+
+MINECRAFT_API_ENABLED=false
+MINECRAFT_API_TYPE=http
+MINECRAFT_HTTP_API_BASE_URL=http://127.0.0.1:8085
+MINECRAFT_HTTP_API_TOKEN=
+MINECRAFT_HTTP_API_TIMEOUT=5
+MINECRAFT_NICKNAME_CHECK_ENABLED=false
+MINECRAFT_NICKNAME_CHECK_STRICT=false
 ```
 
 Боту нужны права читать и отправлять сообщения, создавать topic/forum thread, писать в них и закреплять сообщения. Если права на закрепление нет, бот продолжит работать без закрепления и запишет ошибку в лог. Чтобы бот видел ответы поддержки, у BotFather отключите privacy mode через `/setprivacy` -> `Disable`.
@@ -70,7 +78,7 @@ alembic upgrade head
 python -m app.bot.main
 ```
 
-Миграции создают `users`, `message_maps`, `tickets`, `ticket_answers`, `ticket_answer_media` и добавляют поля для причин закрытия, напоминаний, автозакрытия, предупреждений, ожидания ответа пользователя, пропущенных ответов, служебных сообщений тикета, порядка медиа, `media_group_id`, омниканальных платформ и сохранённого `minecraft_nickname`. Старые Telegram-пользователи получают `platform=telegram`, а `platform_user_id` заполняется старым `telegram_id`.
+Миграции создают `users`, `message_maps`, `tickets`, `ticket_answers`, `ticket_answer_media` и добавляют поля для причин закрытия, напоминаний, автозакрытия, предупреждений, ожидания ответа пользователя, пропущенных ответов, служебных сообщений тикета, порядка медиа, `media_group_id`, омниканальных платформ, сохранённого `minecraft_nickname` и результата проверки игроков через Minecraft API. Старые Telegram-пользователи получают `platform=telegram`, а `platform_user_id` заполняется старым `telegram_id`.
 
 ## Как работает тикет
 
@@ -117,11 +125,37 @@ questions:
     validation_error: "Введите корректный Minecraft-ник: 3–16 символов, латиница, цифры или _."
 ```
 
-Если `profile_field` не указан, бот всё равно считает Minecraft-ником вопросы с `id`: `nickname`, `your_nickname`, `minecraft_nickname`, `player_nickname`. Введённый ник сохраняется в `users.minecraft_nickname` отдельно для каждого пользователя и платформы: Telegram, Discord и VK не смешиваются.
+Если `profile_field` не указан, бот всё равно считает Minecraft-ником пользователя вопросы с `id`: `nickname`, `your_nickname`, `minecraft_nickname`, `player_nickname`. Введённый ник сохраняется в `users.minecraft_nickname` отдельно для каждого пользователя и платформы: Telegram, Discord и VK не смешиваются. Для ника другого игрока используйте `profile_field: "minecraft_target_nickname"`; fallback по `id` работает для `violator_nickname` и `target_nickname`, но такие значения не сохраняются в профиль пользователя.
 
 При `MINECRAFT_NICKNAME_AUTOFILL_ENABLED=true` бот перед повторным вопросом предлагает использовать прошлый ник кнопками `Да` и `Ввести другой`. Telegram использует inline-кнопки, Discord — buttons, VK — keyboard; текстовый fallback принимает `да`, `ввести другой`, `другой`. Если настройка выключена, бот задаёт вопрос как обычный, но продолжает валидировать и сохранять новый ник для `/status` и будущего включения функции. После изменения `.env` нужен перезапуск контейнера.
 
 Для `minecraft_nickname` по умолчанию используется regex `^[A-Za-z0-9_]{3,16}$`. Его можно переопределить в YAML через `validation_regex`, а текст ошибки — через `validation_error`.
+
+## Интеграция с MajureSupportAPI
+
+MajureSupportAPI — отдельный Paper/Purpur-плагин Minecraft-сервера. Support bot не использует RCON: он обращается к HTTP API плагина `GET /player/{nickname}` с заголовком `Authorization: Bearer <token>`.
+
+Пример `.env`:
+
+```env
+MINECRAFT_API_ENABLED=true
+MINECRAFT_API_TYPE=http
+MINECRAFT_HTTP_API_BASE_URL=http://127.0.0.1:8085
+MINECRAFT_HTTP_API_TOKEN=secret
+MINECRAFT_HTTP_API_TIMEOUT=5
+MINECRAFT_NICKNAME_CHECK_ENABLED=true
+MINECRAFT_NICKNAME_CHECK_STRICT=false
+```
+
+`MINECRAFT_API_ENABLED` включает HTTP-интеграцию, а `MINECRAFT_NICKNAME_CHECK_ENABLED` включает проверку при заполнении формы. Если проверка выключена, форма работает как раньше, но карточка тикета покажет `Проверка: отключена` для помеченных Minecraft-полей.
+
+При `MINECRAFT_NICKNAME_CHECK_STRICT=true` пользователь не сможет продолжить с ником, которого API не нашёл, и при недоступном API бот попросит повторить ввод позже. При `false` бот покажет предупреждение и кнопки `Продолжить` / `Ввести другой`; если API недоступен, ник принимается, а предупреждение сохраняется в карточке тикета.
+
+В карточке тикета появляется блок `🎮 Игрок` или `🎮 Проверка игроков` с ником, статусом проверки, UUID, online-статусом, источником и ошибкой, если API не ответил. Для формы жалобы можно проверять оба поля: `minecraft_nickname` для автора обращения и `minecraft_target_nickname` для нарушителя.
+
+Команда `/lookup <nickname>` работает в General и topic группы поддержки. Она вызывает MajureSupportAPI независимо от `MINECRAFT_NICKNAME_CHECK_ENABLED` и показывает результат проверки администратору. Если API выключен или недоступен, бот отвечает короткой ошибкой; токен API не выводится и не логируется.
+
+Если MajureSupportAPI недоступен, support bot продолжает работать. Ошибки HTTP, timeout, connection error и invalid JSON логируются без `Authorization` header.
 
 ## Медиа между платформами
 
@@ -189,7 +223,7 @@ questions:
 - `answer_type` — ожидаемый тип ответа: `text`, `media` или `any`.
 - `allow_multiple` — `true`, если в вопрос можно приложить несколько медиафайлов подряд.
 - `max_files` — необязательное максимальное количество файлов для `allow_multiple: true`; если не указано, бот показывает счётчик без лимита (`Файлы добавлены: 3.`).
-- `profile_field` — необязательный профильный ключ; сейчас поддерживается `minecraft_nickname`.
+- `profile_field` — необязательный профильный ключ; сейчас поддерживаются `minecraft_nickname` и `minecraft_target_nickname`.
 - `validation_regex` — необязательная regex-валидация текстового ответа.
 - `validation_error` — сообщение при ошибке `validation_regex`.
 
@@ -227,7 +261,7 @@ questions:
 
 ## Команды поддержки
 
-Команды работают только в `SUPPORT_CHAT_ID` и только внутри topic пользователя.
+Команды работают только в `SUPPORT_CHAT_ID`. Команды управления тикетом выполняются внутри topic пользователя; `/lookup` можно использовать и в General.
 
 `/block`
 
@@ -240,6 +274,10 @@ questions:
 `/status`
 
 Показывает платформу, `platform_user_id`, username, имя, Minecraft-ник, `blocked`, `topic_id`, ID открытого тикета, статус тикета и дату создания тикета.
+
+`/lookup <nickname>`
+
+Проверяет игрока через MajureSupportAPI и отвечает в группе поддержки. Команда не пересылается пользователю и не показывает API-токен.
 
 `/close`
 

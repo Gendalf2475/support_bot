@@ -55,6 +55,17 @@ def build_minecraft_nickname_keyboard() -> str:
     )
 
 
+def build_minecraft_lookup_confirmation_keyboard() -> str:
+    return _keyboard(
+        [
+            [
+                _button("Продолжить", "positive", {"action": "minecraft_lookup_continue"}),
+                _button("Ввести другой", "secondary", {"action": "minecraft_lookup_other"}),
+            ]
+        ]
+    )
+
+
 def build_preview_keyboard() -> str:
     return _keyboard(
         [
@@ -127,6 +138,13 @@ def build_media_continue_text(
 
 def build_minecraft_nickname_text(nickname: str) -> str:
     return f"Использовать прошлый ник {nickname}?"
+
+
+def build_minecraft_lookup_not_found_text(nickname: str) -> str:
+    return (
+        f"⚠️ Игрок с ником {nickname} не найден на сервере.\n"
+        "Вы можете продолжить, если уверены, что ник указан правильно."
+    )
 
 
 def build_preview_text(form: TicketForm, answers: list[dict[str, Any]]) -> str:

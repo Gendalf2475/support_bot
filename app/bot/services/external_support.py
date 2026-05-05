@@ -22,9 +22,12 @@ from app.bot.services.ticket_form_service import (
     TicketForm,
     TicketFormService,
     TicketQuestion,
+    get_minecraft_profile_field,
     is_minecraft_nickname_question,
+    is_minecraft_profile_question,
     validate_profile_text_answer,
 )
+from app.bot.services.minecraft_service import MinecraftService, player_lookup_to_dict
 from app.bot.services.ticket_formatter import TicketFormatter
 from app.bot.services.ticket_service import TicketService
 from app.bot.services.topic_service import TopicCreationError, TopicService
@@ -46,6 +49,8 @@ class ExternalDraft:
     answers: list[dict[str, Any]] = field(default_factory=list)
     confirming: bool = False
     awaiting_profile_choice: bool = False
+    awaiting_minecraft_lookup_confirmation: bool = False
+    pending_minecraft_answer: dict[str, Any] | None = None
 
 
 class ExternalSupportProcessor:
@@ -56,12 +61,14 @@ class ExternalSupportProcessor:
         settings: Settings,
         ticket_form_service: TicketFormService,
         platform_router: PlatformRouter,
+        minecraft_service: MinecraftService,
     ) -> None:
         self.bot = bot
         self.sessionmaker = sessionmaker
         self.settings = settings
         self.ticket_form_service = ticket_form_service
         self.platform_router = platform_router
+        self.minecraft_service = minecraft_service
         self.drafts: dict[tuple[str, str], ExternalDraft] = {}
 
     async def handle_incoming(self, incoming: IncomingMessage) -> None:
@@ -246,6 +253,26 @@ class ExternalSupportProcessor:
                 await session.commit()
                 return
 
+            if action in {"minecraft_lookup_continue", "minecraft_lookup_other"}:
+                if (
+                    draft.confirming
+                    or not draft.awaiting_minecraft_lookup_confirmation
+                    or draft.question_index >= len(draft.form.questions)
+                    or (question_index is not None and question_index != draft.question_index)
+                ):
+                    await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
+                    await session.commit()
+                    return
+
+                if action == "minecraft_lookup_continue":
+                    await self.accept_pending_minecraft_lookup_answer(session, user, draft)
+                    await session.commit()
+                    return
+
+                await self.return_to_minecraft_question(user, draft)
+                await session.commit()
+                return
+
             if action in {"profile_yes", "profile_other"}:
                 if (
                     draft.confirming
@@ -282,7 +309,12 @@ class ExternalSupportProcessor:
                         await session.commit()
                         return
                     draft.awaiting_profile_choice = False
-                    draft.answers.append(build_text_answer(question, nickname))
+                    answer = build_text_answer(question, nickname)
+                    if await self.maybe_handle_minecraft_lookup(session, user, draft, question, answer):
+                        await session.commit()
+                        return
+                    draft.answers.append(answer)
+                    await maybe_save_minecraft_nickname(session, user, question, answer)
                     await self.advance_or_summary(user, draft)
                     await session.commit()
                     return
@@ -408,6 +440,10 @@ class ExternalSupportProcessor:
 
         if draft.awaiting_profile_choice:
             await self.handle_profile_choice_text(user, incoming, draft)
+            return
+
+        if draft.awaiting_minecraft_lookup_confirmation:
+            await self.handle_minecraft_lookup_confirmation_text(session, user, incoming, draft)
             return
 
         if draft.confirming:
@@ -549,6 +585,9 @@ class ExternalSupportProcessor:
             )
             return
 
+        if await self.maybe_handle_minecraft_lookup(session, user, draft, question, answer):
+            return
+
         draft.answers.append(answer)
         await maybe_save_minecraft_nickname(session, user, question, answer)
         await self.advance_or_summary(user, draft)
@@ -568,6 +607,8 @@ class ExternalSupportProcessor:
         question = draft.form.questions[draft.question_index]
         if should_offer_minecraft_nickname(self.settings, user, question):
             draft.awaiting_profile_choice = True
+            draft.awaiting_minecraft_lookup_confirmation = False
+            draft.pending_minecraft_answer = None
             await self.platform_router.send_minecraft_nickname_offer(
                 user,
                 draft.question_index,
@@ -577,6 +618,8 @@ class ExternalSupportProcessor:
             return
 
         draft.awaiting_profile_choice = False
+        draft.awaiting_minecraft_lookup_confirmation = False
+        draft.pending_minecraft_answer = None
         await self.platform_router.send_question(user, draft.form, draft.question_index, telegram_bot=self.bot)
 
     async def handle_profile_choice_text(self, user: User, incoming: IncomingMessage, draft: ExternalDraft) -> None:
@@ -619,9 +662,119 @@ class ExternalSupportProcessor:
             telegram_bot=self.bot,
         )
 
+    async def maybe_handle_minecraft_lookup(
+        self,
+        session: AsyncSession,
+        user: User,
+        draft: ExternalDraft,
+        question: TicketQuestion,
+        answer: dict[str, Any],
+    ) -> bool:
+        profile_field = get_minecraft_profile_field(question)
+        if profile_field is None:
+            return False
+
+        nickname = str(answer.get("answer_text") or "").strip()
+        if not nickname:
+            return False
+
+        lookup = await self.minecraft_service.check_player(nickname)
+        answer["profile_field"] = profile_field
+        answer["minecraft_lookup"] = player_lookup_to_dict(lookup)
+
+        if lookup.error == "disabled":
+            return False
+
+        if lookup.exists is True:
+            await self.platform_router.send_text(user, f"✅ Игрок найден: {lookup.nickname or nickname}", telegram_bot=self.bot)
+            return False
+
+        if lookup.exists is False:
+            if self.settings.minecraft_nickname_check_strict:
+                await self.platform_router.send_question(
+                    user,
+                    draft.form,
+                    draft.question_index,
+                    prefix_text=(
+                        f"❌ Игрок с ником {nickname} не найден на сервере.\n"
+                        "Проверьте ник и введите снова."
+                    ),
+                    telegram_bot=self.bot,
+                )
+                return True
+
+            draft.awaiting_minecraft_lookup_confirmation = True
+            draft.pending_minecraft_answer = answer
+            await self.platform_router.send_minecraft_lookup_confirmation(
+                user,
+                draft.question_index,
+                nickname,
+                telegram_bot=self.bot,
+            )
+            return True
+
+        if self.settings.minecraft_nickname_check_strict:
+            await self.platform_router.send_question(
+                user,
+                draft.form,
+                draft.question_index,
+                prefix_text=(
+                    "⚠️ Сейчас не удалось проверить ник через сервер.\n"
+                    "Попробуйте позже или введите ник ещё раз."
+                ),
+                telegram_bot=self.bot,
+            )
+            return True
+
+        return False
+
+    async def accept_pending_minecraft_lookup_answer(
+        self,
+        session: AsyncSession,
+        user: User,
+        draft: ExternalDraft,
+    ) -> None:
+        if draft.pending_minecraft_answer is None or draft.question_index >= len(draft.form.questions):
+            await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
+            return
+
+        question = draft.form.questions[draft.question_index]
+        answer = draft.pending_minecraft_answer
+        draft.awaiting_minecraft_lookup_confirmation = False
+        draft.pending_minecraft_answer = None
+        draft.answers.append(answer)
+        await maybe_save_minecraft_nickname(session, user, question, answer)
+        await self.advance_or_summary(user, draft)
+
+    async def return_to_minecraft_question(self, user: User, draft: ExternalDraft) -> None:
+        if draft.question_index >= len(draft.form.questions):
+            await self.platform_router.send_text(user, STALE_ACTION_TEXT, telegram_bot=self.bot)
+            return
+        draft.awaiting_minecraft_lookup_confirmation = False
+        draft.pending_minecraft_answer = None
+        await self.platform_router.send_question(user, draft.form, draft.question_index, telegram_bot=self.bot)
+
+    async def handle_minecraft_lookup_confirmation_text(
+        self,
+        session: AsyncSession,
+        user: User,
+        incoming: IncomingMessage,
+        draft: ExternalDraft,
+    ) -> None:
+        text = (incoming.text or "").strip().casefold()
+        if text in {"продолжить", "continue", "далее"}:
+            await self.accept_pending_minecraft_lookup_answer(session, user, draft)
+            return
+        if text in {"ввести другой", "другой", "нет", "no"}:
+            await self.return_to_minecraft_question(user, draft)
+            return
+        await self.platform_router.send_text(user, "Напишите: Продолжить или Ввести другой.", telegram_bot=self.bot)
+
     async def show_summary(self, user: User, draft: ExternalDraft) -> None:
         draft.confirming = True
         draft.awaiting_profile_choice = False
+        draft.awaiting_minecraft_lookup_confirmation = False
+        draft.pending_minecraft_answer = None
         await self.platform_router.send_ticket_preview(user, draft.form, draft.answers, telegram_bot=self.bot)
 
     async def submit_ticket(self, session: AsyncSession, user: User, draft: ExternalDraft) -> Ticket:
@@ -761,7 +914,7 @@ async def send_external_attachment_to_topic(
 def validate_external_answer(question: TicketQuestion, incoming: IncomingMessage) -> tuple[dict[str, Any], str | None]:
     text = (incoming.text or "").strip()
     attachments = incoming.attachments
-    if is_minecraft_nickname_question(question):
+    if is_minecraft_profile_question(question):
         if not text:
             return {}, "Пожалуйста, отправьте текст."
         validation_error = validate_profile_text_answer(question, text)
@@ -821,6 +974,7 @@ def build_text_answer(question: TicketQuestion, text: str) -> dict[str, Any]:
         "question_text": question.text,
         "answer_type": ANSWER_TYPE_TEXT,
         "answer_text": text,
+        "profile_field": get_minecraft_profile_field(question),
         "skipped": False,
     }
 

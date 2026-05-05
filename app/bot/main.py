@@ -16,6 +16,7 @@ from app.bot.database.session import create_sessionmaker
 from app.bot.handlers import admin, support_messages, user_messages
 from app.bot.middlewares.block_check import BlockCheckMiddleware, DatabaseSessionMiddleware
 from app.bot.services.external_support import ExternalSupportProcessor
+from app.bot.services.minecraft_service import MinecraftService
 from app.bot.services.platform_router import PlatformRouter
 from app.bot.services.ticket_form_service import TicketFormService
 from app.bot.services.ticket_scheduler import TicketMaintenanceScheduler
@@ -42,8 +43,9 @@ async def main() -> None:
 
     sessionmaker = create_sessionmaker(settings.database_url)
     ticket_form_service = TicketFormService(settings.ticket_forms_path)
+    minecraft_service = MinecraftService(settings)
     platform_router = PlatformRouter()
-    external_processor = ExternalSupportProcessor(bot, sessionmaker, settings, ticket_form_service, platform_router)
+    external_processor = ExternalSupportProcessor(bot, sessionmaker, settings, ticket_form_service, platform_router, minecraft_service)
     telegram_channel = TelegramChannel(bot)
     discord_channel = DiscordChannel(settings, external_processor)
     vk_channel = VKChannel(settings, external_processor)
@@ -55,6 +57,7 @@ async def main() -> None:
     dispatcher["settings"] = settings
     dispatcher["ticket_form_service"] = ticket_form_service
     dispatcher["platform_router"] = platform_router
+    dispatcher["minecraft_service"] = minecraft_service
 
     db_middleware = DatabaseSessionMiddleware(sessionmaker)
     block_check_middleware = BlockCheckMiddleware()

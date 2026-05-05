@@ -20,12 +20,15 @@ from app.bot.keyboards import (
     CALLBACK_CANCEL_TICKET,
     CALLBACK_CONTINUE_MEDIA,
     CALLBACK_FORM_PREFIX,
+    CALLBACK_MINECRAFT_LOOKUP_CONTINUE,
+    CALLBACK_MINECRAFT_LOOKUP_OTHER,
     CALLBACK_OPEN_TICKET,
     CALLBACK_PROFILE_NICKNAME_OTHER,
     CALLBACK_PROFILE_NICKNAME_YES,
     CALLBACK_RESTART_TICKET,
     CALLBACK_SKIP_QUESTION,
     CALLBACK_SUBMIT_TICKET,
+    minecraft_lookup_confirmation_keyboard,
     minecraft_nickname_keyboard,
     multiple_media_keyboard,
     open_ticket_keyboard,
@@ -43,9 +46,12 @@ from app.bot.services.ticket_form_service import (
     TicketForm,
     TicketFormService,
     TicketQuestion,
+    get_minecraft_profile_field,
     is_minecraft_nickname_question,
+    is_minecraft_profile_question,
     validate_profile_text_answer,
 )
+from app.bot.services.minecraft_service import MinecraftService, player_lookup_to_dict
 from app.bot.services.ticket_formatter import TicketFormatter
 from app.bot.services.ticket_service import TicketService
 from app.bot.services.topic_service import TopicCreationError, TopicService
@@ -83,6 +89,7 @@ CONTINUE_MEDIA_LOCKS: dict[int, asyncio.Lock] = {}
 
 class TicketFlow(StatesGroup):
     profile_choice = State()
+    minecraft_lookup_confirm = State()
     answering = State()
     confirming = State()
 
@@ -199,6 +206,7 @@ async def use_saved_minecraft_nickname(
     settings: Settings,
     state: FSMContext,
     ticket_form_service: TicketFormService,
+    minecraft_service: MinecraftService,
     known_user: User | None = None,
 ) -> None:
     message = callback.message
@@ -207,7 +215,7 @@ async def use_saved_minecraft_nickname(
         return
 
     user = await get_or_create_user(session, callback.from_user, known_user)
-    applied = await apply_saved_minecraft_nickname(message, state, ticket_form_service, user, settings)
+    applied = await apply_saved_minecraft_nickname(message, session, state, ticket_form_service, minecraft_service, user, settings)
     await callback.answer("" if applied else "Действие устарело.", show_alert=not applied)
 
 
@@ -242,6 +250,7 @@ async def handle_minecraft_nickname_choice_text(
     settings: Settings,
     state: FSMContext,
     ticket_form_service: TicketFormService,
+    minecraft_service: MinecraftService,
     known_user: User | None = None,
 ) -> None:
     if message.from_user is None or message.from_user.is_bot:
@@ -256,7 +265,7 @@ async def handle_minecraft_nickname_choice_text(
     text = (message.text or "").strip().casefold()
 
     if text in {"да", "yes", "y"}:
-        if await apply_saved_minecraft_nickname(message, state, ticket_form_service, user, settings):
+        if await apply_saved_minecraft_nickname(message, session, state, ticket_form_service, minecraft_service, user, settings):
             return
         await message.answer("Это действие уже неактуально.")
         return
@@ -290,6 +299,88 @@ async def handle_minecraft_nickname_choice_text(
     )
 
 
+@router.callback_query(StateFilter(TicketFlow.minecraft_lookup_confirm), F.data == CALLBACK_MINECRAFT_LOOKUP_CONTINUE)
+async def continue_with_unverified_minecraft_nickname(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    settings: Settings,
+    state: FSMContext,
+    ticket_form_service: TicketFormService,
+    known_user: User | None = None,
+) -> None:
+    message = callback.message
+    if not isinstance(message, Message) or message.chat.type != ChatType.PRIVATE:
+        await callback.answer("Действие доступно только в личном чате с ботом.", show_alert=True)
+        return
+
+    user = await get_or_create_user(session, callback.from_user, known_user)
+    continued = await accept_pending_minecraft_lookup_answer(message, session, state, ticket_form_service, user, settings)
+    await callback.answer("" if continued else "Действие устарело.", show_alert=not continued)
+
+
+@router.callback_query(StateFilter(TicketFlow.minecraft_lookup_confirm), F.data == CALLBACK_MINECRAFT_LOOKUP_OTHER)
+async def enter_other_unverified_minecraft_nickname(
+    callback: CallbackQuery,
+    state: FSMContext,
+    ticket_form_service: TicketFormService,
+) -> None:
+    message = callback.message
+    if not isinstance(message, Message) or message.chat.type != ChatType.PRIVATE:
+        await callback.answer("Действие доступно только в личном чате с ботом.", show_alert=True)
+        return
+
+    returned = await return_to_minecraft_question(message, state, ticket_form_service)
+    await callback.answer("" if returned else "Действие устарело.", show_alert=not returned)
+
+
+@router.message(StateFilter(TicketFlow.minecraft_lookup_confirm), F.chat.type == ChatType.PRIVATE)
+async def handle_minecraft_lookup_confirmation_text(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+    state: FSMContext,
+    ticket_form_service: TicketFormService,
+    known_user: User | None = None,
+) -> None:
+    if message.from_user is None or message.from_user.is_bot:
+        return
+    if is_command_message(message):
+        return
+
+    text = (message.text or "").strip().casefold()
+    user = await get_or_create_user(session, message.from_user, known_user)
+    if text in {"продолжить", "continue", "далее"}:
+        if await accept_pending_minecraft_lookup_answer(message, session, state, ticket_form_service, user, settings):
+            return
+        await message.answer("Это действие уже неактуально.")
+        return
+    if text in {"ввести другой", "другой", "нет", "no"}:
+        if await return_to_minecraft_question(message, state, ticket_form_service):
+            return
+        await message.answer("Это действие уже неактуально.")
+        return
+    if text in {"отмена", "cancel"}:
+        data = await state.get_data()
+        form = get_state_form(ticket_form_service, data)
+        if form is not None:
+            await TicketService(session, settings.support_chat_id).create_cancelled_ticket(
+                user,
+                form,
+                list(data.get("answers", [])),
+            )
+        await state.clear()
+        await message.answer(
+            CANCELLED_TEXT,
+            reply_markup=ticket_forms_reply_keyboard(ticket_form_service.get_forms()) if ticket_form_service.enabled else None,
+        )
+        return
+
+    await message.answer(
+        "Напишите: Продолжить или Ввести другой.",
+        reply_markup=minecraft_lookup_confirmation_keyboard(),
+    )
+
+
 @router.message(StateFilter(TicketFlow.answering), F.chat.type == ChatType.PRIVATE)
 async def handle_form_answer(
     message: Message,
@@ -297,6 +388,7 @@ async def handle_form_answer(
     settings: Settings,
     state: FSMContext,
     ticket_form_service: TicketFormService,
+    minecraft_service: MinecraftService,
     known_user: User | None = None,
     is_blocked_user: bool = False,
 ) -> None:
@@ -385,8 +477,23 @@ async def handle_form_answer(
             "source_message_id": message.message_id,
         }
     )
-    await maybe_save_minecraft_nickname(session, user, question, answer)
     answers = list(data.get("answers", []))
+    if await maybe_handle_minecraft_lookup(
+        message=message,
+        session=session,
+        state=state,
+        form=form,
+        question=question,
+        question_index=question_index,
+        user=user,
+        settings=settings,
+        minecraft_service=minecraft_service,
+        answer=answer,
+        answers=answers,
+    ):
+        return
+
+    await maybe_save_minecraft_nickname(session, user, question, answer)
     answers.append(answer)
     await move_to_next_question_or_summary(message, state, form, answers, question_index + 1, user=user, settings=settings)
 
@@ -679,6 +786,8 @@ async def submit_ticket(
             CALLBACK_SUBMIT_TICKET,
             CALLBACK_PROFILE_NICKNAME_YES,
             CALLBACK_PROFILE_NICKNAME_OTHER,
+            CALLBACK_MINECRAFT_LOOKUP_CONTINUE,
+            CALLBACK_MINECRAFT_LOOKUP_OTHER,
         }
     )
     | (F.data == CALLBACK_CONTINUE_MEDIA)
@@ -1399,8 +1508,10 @@ def should_offer_minecraft_nickname(settings: Settings, user: User, question: Ti
 
 async def apply_saved_minecraft_nickname(
     message: Message,
+    session: AsyncSession,
     state: FSMContext,
     ticket_form_service: TicketFormService,
+    minecraft_service: MinecraftService,
     user: User,
     settings: Settings,
 ) -> bool:
@@ -1426,7 +1537,24 @@ async def apply_saved_minecraft_nickname(
         return True
 
     answers = list(data.get("answers", []))
-    answers.append(build_text_profile_answer(question, nickname))
+    answer = build_text_profile_answer(question, nickname)
+    if await maybe_handle_minecraft_lookup(
+        message=message,
+        session=session,
+        state=state,
+        form=form,
+        question=question,
+        question_index=question_index,
+        user=user,
+        settings=settings,
+        minecraft_service=minecraft_service,
+        answer=answer,
+        answers=answers,
+    ):
+        return True
+
+    await maybe_save_minecraft_nickname(session, user, question, answer)
+    answers.append(answer)
     await move_to_next_question_or_summary(
         message,
         state,
@@ -1436,6 +1564,135 @@ async def apply_saved_minecraft_nickname(
         user=user,
         settings=settings,
     )
+    return True
+
+
+async def maybe_handle_minecraft_lookup(
+    *,
+    message: Message,
+    session: AsyncSession,
+    state: FSMContext,
+    form: TicketForm,
+    question: TicketQuestion,
+    question_index: int,
+    user: User,
+    settings: Settings,
+    minecraft_service: MinecraftService,
+    answer: dict[str, Any],
+    answers: list[dict[str, Any]],
+) -> bool:
+    profile_field = get_minecraft_profile_field(question)
+    if profile_field is None:
+        return False
+
+    nickname = str(answer.get("answer_text") or "").strip()
+    if not nickname:
+        return False
+
+    lookup = await minecraft_service.check_player(nickname)
+    answer["profile_field"] = profile_field
+    answer["minecraft_lookup"] = player_lookup_to_dict(lookup)
+
+    if lookup.error == "disabled":
+        return False
+
+    if lookup.exists is True:
+        await message.answer(f"✅ Игрок найден: {lookup.nickname or nickname}")
+        return False
+
+    if lookup.exists is False:
+        if settings.minecraft_nickname_check_strict:
+            await state.set_state(TicketFlow.answering)
+            await state.update_data(form_id=form.id, answers=answers, question_index=question_index)
+            await message.answer(
+                (
+                    f"❌ Игрок с ником {nickname} не найден на сервере.\n"
+                    "Проверьте ник и введите снова.\n\n"
+                    f"{build_question_text(question)}"
+                ),
+                reply_markup=get_question_reply_markup(question, question_index),
+            )
+            return True
+
+        await state.set_state(TicketFlow.minecraft_lookup_confirm)
+        await state.update_data(
+            form_id=form.id,
+            answers=answers,
+            question_index=question_index,
+            pending_minecraft_answer=answer,
+        )
+        await message.answer(
+            (
+                f"⚠️ Игрок с ником {nickname} не найден на сервере.\n"
+                "Вы можете продолжить, если уверены, что ник указан правильно."
+            ),
+            reply_markup=minecraft_lookup_confirmation_keyboard(),
+        )
+        return True
+
+    if settings.minecraft_nickname_check_strict:
+        await state.set_state(TicketFlow.answering)
+        await state.update_data(form_id=form.id, answers=answers, question_index=question_index)
+        await message.answer(
+            (
+                "⚠️ Сейчас не удалось проверить ник через сервер.\n"
+                "Попробуйте позже или введите ник ещё раз.\n\n"
+                f"{build_question_text(question)}"
+            ),
+            reply_markup=get_question_reply_markup(question, question_index),
+        )
+        return True
+
+    return False
+
+
+async def accept_pending_minecraft_lookup_answer(
+    message: Message,
+    session: AsyncSession,
+    state: FSMContext,
+    ticket_form_service: TicketFormService,
+    user: User,
+    settings: Settings,
+) -> bool:
+    data = await state.get_data()
+    form = get_state_form(ticket_form_service, data)
+    question_index = int(data.get("question_index", 0))
+    answer = data.get("pending_minecraft_answer")
+    if form is None or question_index >= len(form.questions) or not isinstance(answer, dict):
+        await state.clear()
+        return False
+
+    question = form.questions[question_index]
+    answers = list(data.get("answers", []))
+    await maybe_save_minecraft_nickname(session, user, question, answer)
+    answers.append(answer)
+    await move_to_next_question_or_summary(
+        message,
+        state,
+        form,
+        answers,
+        question_index + 1,
+        user=user,
+        settings=settings,
+    )
+    return True
+
+
+async def return_to_minecraft_question(
+    message: Message,
+    state: FSMContext,
+    ticket_form_service: TicketFormService,
+) -> bool:
+    data = await state.get_data()
+    form = get_state_form(ticket_form_service, data)
+    question_index = int(data.get("question_index", 0))
+    if form is None or question_index >= len(form.questions):
+        await state.clear()
+        return False
+
+    await state.set_state(TicketFlow.answering)
+    await state.update_data(pending_minecraft_answer=None)
+    await ask_current_question(message, form, question_index)
     return True
 
 
@@ -1491,7 +1748,7 @@ def validate_question_answer(
     if answer is None:
         return {}, "Этот тип сообщения не поддерживается. Отправьте текст или медиа."
 
-    if is_minecraft_nickname_question(question):
+    if is_minecraft_profile_question(question):
         text = str(answer.get("answer_text") or answer.get("caption") or "").strip()
         if not text:
             return {}, "Пожалуйста, отправьте текст."
@@ -1563,6 +1820,7 @@ def build_text_profile_answer(question: TicketQuestion, text: str) -> dict[str, 
         "file_id": None,
         "media_type": None,
         "caption": None,
+        "profile_field": get_minecraft_profile_field(question),
         "skipped": False,
     }
 

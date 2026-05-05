@@ -98,9 +98,12 @@ forms:
 
       - id: "violator_nickname"
         text: "Введите ник нарушителя:"
-        help_text: "Если нарушителей несколько, укажите их через запятую."
+        help_text: "Укажите один ник точно так же, как он отображается на сервере."
         required: true
         answer_type: "text"
+        profile_field: "minecraft_target_nickname"
+        validation_regex: "^[A-Za-z0-9_]{3,16}$"
+        validation_error: "Введите корректный Minecraft-ник: 3–16 символов, латиница, цифры или _."
 
       - id: "reason"
         text: "Опишите нарушение:"

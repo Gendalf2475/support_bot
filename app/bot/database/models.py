@@ -126,6 +126,13 @@ class TicketAnswer(Base):
     media_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
     caption: Mapped[str | None] = mapped_column(Text, nullable=True)
     skipped: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    profile_field: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    minecraft_lookup_nickname: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    minecraft_lookup_exists: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    minecraft_lookup_uuid: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    minecraft_lookup_online: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    minecraft_lookup_source: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    minecraft_lookup_error: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
     ticket: Mapped[Ticket] = relationship(back_populates="answers")

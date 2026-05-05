@@ -16,7 +16,10 @@ ANSWER_TYPE_MEDIA = "media"
 ANSWER_TYPE_ANY = "any"
 ALLOWED_ANSWER_TYPES = {ANSWER_TYPE_TEXT, ANSWER_TYPE_MEDIA, ANSWER_TYPE_ANY}
 PROFILE_FIELD_MINECRAFT_NICKNAME = "minecraft_nickname"
+PROFILE_FIELD_MINECRAFT_TARGET_NICKNAME = "minecraft_target_nickname"
+MINECRAFT_PROFILE_FIELDS = {PROFILE_FIELD_MINECRAFT_NICKNAME, PROFILE_FIELD_MINECRAFT_TARGET_NICKNAME}
 MINECRAFT_NICKNAME_QUESTION_IDS = {"nickname", "your_nickname", "minecraft_nickname", "player_nickname"}
+MINECRAFT_TARGET_NICKNAME_QUESTION_IDS = {"violator_nickname", "target_nickname"}
 DEFAULT_MINECRAFT_NICKNAME_REGEX = r"^[A-Za-z0-9_]{3,16}$"
 DEFAULT_MINECRAFT_NICKNAME_VALIDATION_ERROR = "Введите корректный Minecraft-ник: 3–16 символов, латиница, цифры или _."
 
@@ -309,14 +312,28 @@ class TicketFormService:
 
 
 def is_minecraft_nickname_question(question: TicketQuestion) -> bool:
+    return get_minecraft_profile_field(question) == PROFILE_FIELD_MINECRAFT_NICKNAME
+
+
+def is_minecraft_profile_question(question: TicketQuestion) -> bool:
+    return get_minecraft_profile_field(question) is not None
+
+
+def get_minecraft_profile_field(question: TicketQuestion) -> str | None:
     profile_field = str(question.profile_field or "").strip().lower()
-    if profile_field == PROFILE_FIELD_MINECRAFT_NICKNAME:
-        return True
-    return str(question.id or "").strip().lower() in MINECRAFT_NICKNAME_QUESTION_IDS
+    if profile_field in MINECRAFT_PROFILE_FIELDS:
+        return profile_field
+
+    question_id = str(question.id or "").strip().lower()
+    if question_id in MINECRAFT_NICKNAME_QUESTION_IDS:
+        return PROFILE_FIELD_MINECRAFT_NICKNAME
+    if question_id in MINECRAFT_TARGET_NICKNAME_QUESTION_IDS:
+        return PROFILE_FIELD_MINECRAFT_TARGET_NICKNAME
+    return None
 
 
 def validate_profile_text_answer(question: TicketQuestion, text: str) -> str | None:
-    if not is_minecraft_nickname_question(question):
+    if not is_minecraft_profile_question(question):
         return None
 
     regex = question.validation_regex or DEFAULT_MINECRAFT_NICKNAME_REGEX

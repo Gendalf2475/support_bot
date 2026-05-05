@@ -16,7 +16,7 @@ from sqlalchemy.orm import selectinload
 from app.bot.database.models import Platform, Ticket, TicketAnswer, TicketAnswerMedia, TicketStatus, User, utcnow
 from app.bot.services.platform_router import PlatformRouter
 from app.bot.services.ticket_formatter import TicketFormatter
-from app.bot.services.ticket_form_service import TicketCloseReason, TicketForm
+from app.bot.services.ticket_form_service import TicketCloseReason, TicketForm, get_minecraft_profile_field
 
 
 logger = logging.getLogger(__name__)
@@ -492,6 +492,7 @@ class TicketService:
             for answer in answers_by_question.get(question.id, []):
                 media_files = self.extract_media_files(answer)
                 first_media = media_files[0] if media_files else None
+                minecraft_lookup = answer.get("minecraft_lookup") if isinstance(answer.get("minecraft_lookup"), dict) else {}
                 ticket_answer = TicketAnswer(
                     ticket_id=ticket.id,
                     question_id=question.id,
@@ -502,6 +503,13 @@ class TicketService:
                     media_type=first_media.get("media_type") if first_media else answer.get("media_type"),
                     caption=first_media.get("caption") if first_media else answer.get("caption"),
                     skipped=bool(answer.get("skipped", False)),
+                    profile_field=answer.get("profile_field") or get_minecraft_profile_field(question),
+                    minecraft_lookup_nickname=minecraft_lookup.get("nickname"),
+                    minecraft_lookup_exists=minecraft_lookup.get("exists"),
+                    minecraft_lookup_uuid=minecraft_lookup.get("uuid"),
+                    minecraft_lookup_online=minecraft_lookup.get("online"),
+                    minecraft_lookup_source=minecraft_lookup.get("source"),
+                    minecraft_lookup_error=minecraft_lookup.get("error"),
                 )
                 for media_index, media in enumerate(media_files):
                     ticket_answer.media_files.append(

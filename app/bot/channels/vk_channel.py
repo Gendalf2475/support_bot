@@ -120,6 +120,20 @@ class VKChannel:
             keyboard=vk_ui.build_minecraft_nickname_keyboard(),
         )
 
+    async def send_minecraft_lookup_confirmation(
+        self,
+        user: Any,
+        question_index: int,
+        nickname: str,
+    ) -> SentMessageRef | None:
+        from app.bot.channels import vk_ui
+
+        return await self._send_vk_message(
+            user.platform_user_id,
+            vk_ui.build_minecraft_lookup_not_found_text(nickname),
+            keyboard=vk_ui.build_minecraft_lookup_confirmation_keyboard(),
+        )
+
     async def send_ticket_preview(self, user: Any, form: Any, answers: list[dict[str, Any]]) -> SentMessageRef | None:
         from app.bot.channels import vk_ui
 

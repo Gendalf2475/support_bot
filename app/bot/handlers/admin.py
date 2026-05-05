@@ -19,6 +19,7 @@ from app.bot.keyboards import (
     closed_ticket_keyboard,
     SUPPORT_CLOSE_TICKET_TEXT,
 )
+from app.bot.services.minecraft_service import MinecraftService, PlayerLookupResult
 from app.bot.services.ticket_form_service import TicketFormService
 from app.bot.services.ticket_service import CLOSE_REASONS, MANUAL_CLOSE_REASON_CODES, TicketService
 from app.bot.services.platform_router import PlatformRouter
@@ -103,6 +104,35 @@ async def user_status(message: Message, bot: Bot, session: AsyncSession, setting
         f"updated_at: {format_dt(user.updated_at)}"
     )
     await send_to_topic(bot, settings.support_chat_id, user.topic_id, text)
+
+
+@router.message(Command("lookup"))
+async def lookup_player(message: Message, settings: Settings, minecraft_service: MinecraftService) -> None:
+    if message.chat.id != settings.support_chat_id:
+        return
+    if message.from_user is None:
+        await message.answer("Не удалось определить, кто выполняет команду.")
+        return
+
+    nickname = parse_lookup_nickname(message.text or "")
+    if not nickname:
+        await message.answer("Использование: /lookup <nickname>")
+        return
+
+    logger.info("/lookup used by telegram_id=%s nickname=%s", message.from_user.id, nickname)
+    if not minecraft_service.is_enabled():
+        await message.answer("Minecraft API выключен в настройках.")
+        return
+
+    result = await minecraft_service.check_player(nickname, respect_check_enabled=False)
+    if result.error == "disabled":
+        await message.answer("Minecraft API выключен в настройках.")
+        return
+    if result.exists is None and result.error:
+        await message.answer(f"Не удалось проверить игрока: {result.error}")
+        return
+
+    await message.answer(format_player_lookup_result(result))
 
 
 @router.message(Command("close"))
@@ -422,6 +452,41 @@ def parse_close_reason_callback(callback_data: str | None) -> tuple[int, str] | 
         return None
 
     return ticket_id, reason
+
+
+def parse_lookup_nickname(text: str) -> str | None:
+    parts = str(text or "").strip().split(maxsplit=1)
+    if len(parts) < 2:
+        return None
+    nickname = parts[1].strip()
+    if " " in nickname:
+        nickname = nickname.split(maxsplit=1)[0]
+    return nickname or None
+
+
+def format_player_lookup_result(result: PlayerLookupResult) -> str:
+    nickname = result.nickname or "не указан"
+    lines = [
+        "🎮 Информация об игроке",
+        "",
+        f"Ник: {nickname}",
+    ]
+    if result.exists is True:
+        lines.append("Проверка: ✅ найден")
+    elif result.exists is False:
+        lines.append("Проверка: ❌ не найден")
+    else:
+        lines.append("Проверка: ⚠️ не удалось проверить")
+
+    if result.uuid:
+        lines.append(f"UUID: {result.uuid}")
+    if result.online is not None:
+        lines.append(f"Онлайн: {'да' if result.online else 'нет'}")
+    if result.source:
+        lines.append(f"Источник: {result.source}")
+    if result.exists is None and result.error:
+        lines.append(f"Ошибка: {result.error}")
+    return "\n".join(lines)
 
 
 def validate_ticket_for_callback(ticket: Ticket | None, topic_id: int) -> str | None:

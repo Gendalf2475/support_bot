@@ -7,7 +7,13 @@ from html import escape
 from typing import Any
 
 from app.bot.database.models import Platform, Ticket, TicketAnswer, TicketAnswerMedia, TicketStatus, User
-from app.bot.services.ticket_form_service import TicketForm, TicketQuestion
+from app.bot.services.ticket_form_service import (
+    PROFILE_FIELD_MINECRAFT_NICKNAME,
+    PROFILE_FIELD_MINECRAFT_TARGET_NICKNAME,
+    TicketForm,
+    TicketQuestion,
+    get_minecraft_profile_field,
+)
 
 
 TELEGRAM_MESSAGE_LIMIT = 4096
@@ -25,12 +31,14 @@ class TicketFormatter:
         answers: Sequence[Mapping[str, Any]],
     ) -> list[str]:
         answer_blocks = cls._format_form_answer_blocks(form.questions, answers)
+        minecraft_lookup_block = cls._format_mapping_minecraft_lookup_block(form.questions, answers)
         return cls._build_card_parts(
             ticket_id=ticket.id,
             form_title=form.admin_title,
             user=user,
             status=ticket.status,
             created_at=ticket.created_at,
+            extra_blocks=[minecraft_lookup_block] if minecraft_lookup_block else (),
             answer_blocks=answer_blocks,
         )
 
@@ -42,12 +50,14 @@ class TicketFormatter:
         close_reason_label: str | None = None,
     ) -> list[str]:
         answer_blocks = cls._format_stored_answer_blocks(ticket.answers)
+        minecraft_lookup_block = cls._format_stored_minecraft_lookup_block(ticket.answers)
         return cls._build_card_parts(
             ticket_id=ticket.id,
             form_title=ticket.form_title,
             user=user,
             status=ticket.status,
             created_at=ticket.created_at,
+            extra_blocks=[minecraft_lookup_block] if minecraft_lookup_block else (),
             answer_blocks=answer_blocks,
             close_reason_label=close_reason_label,
             closed_at=ticket.closed_at,
@@ -169,19 +179,21 @@ class TicketFormatter:
         status: TicketStatus,
         created_at: datetime,
         answer_blocks: Sequence[str],
+        extra_blocks: Sequence[str] = (),
         close_reason_label: str | None = None,
         closed_at: datetime | None = None,
     ) -> list[str]:
         header = cls._build_header(ticket_id, form_title, user)
         footer = cls._build_footer(status, created_at, close_reason_label, closed_at)
         formatted_answer_blocks = list(answer_blocks) or ["— Нет данных"]
-        full_text = cls._join_sections([header, "Данные формы:", *formatted_answer_blocks, footer])
+        full_text = cls._join_sections([header, *extra_blocks, "Данные формы:", *formatted_answer_blocks, footer])
         if len(full_text) <= CARD_MESSAGE_LIMIT:
             return [full_text]
 
         summary_header = "\n".join(
             [
                 header,
+                *extra_blocks,
                 "Данные формы:",
                 "Часть данных не поместилась в карточку и отправлена ниже.",
             ]
@@ -269,6 +281,127 @@ class TicketFormatter:
         for number, (question_id, question_text) in enumerate(ordered_questions, start=1):
             blocks.append(cls._format_answer_block(number, question_text, grouped[question_id]))
         return blocks
+
+    @classmethod
+    def _format_mapping_minecraft_lookup_block(
+        cls,
+        questions: Sequence[TicketQuestion],
+        answers: Sequence[Mapping[str, Any]],
+    ) -> str | None:
+        answers_by_question = cls._group_mapping_answers(answers)
+        items: list[dict[str, Any]] = []
+        used_keys: set[tuple[str, str]] = set()
+        for question in questions:
+            profile_field = get_minecraft_profile_field(question)
+            if profile_field is None:
+                continue
+            for answer in answers_by_question.get(question.id, []):
+                if answer.get("skipped"):
+                    continue
+                nickname = str(answer.get("answer_text") or "").strip()
+                if not nickname:
+                    continue
+                key = (profile_field, nickname.casefold())
+                if key in used_keys:
+                    continue
+                used_keys.add(key)
+                lookup = answer.get("minecraft_lookup")
+                if not isinstance(lookup, Mapping):
+                    lookup = {"nickname": nickname, "exists": None, "error": "disabled"}
+                items.append(
+                    {
+                        "label": cls._minecraft_lookup_label(profile_field, question.text),
+                        "nickname": str(lookup.get("nickname") or nickname),
+                        "exists": lookup.get("exists"),
+                        "uuid": lookup.get("uuid"),
+                        "online": lookup.get("online"),
+                        "source": lookup.get("source"),
+                        "error": lookup.get("error"),
+                    }
+                )
+        return cls._format_minecraft_lookup_items(items)
+
+    @classmethod
+    def _format_stored_minecraft_lookup_block(cls, answers: Sequence[TicketAnswer]) -> str | None:
+        items: list[dict[str, Any]] = []
+        used_keys: set[tuple[str, str]] = set()
+        for answer in sorted(answers, key=lambda item: item.id):
+            profile_field = answer.profile_field
+            if profile_field not in {PROFILE_FIELD_MINECRAFT_NICKNAME, PROFILE_FIELD_MINECRAFT_TARGET_NICKNAME}:
+                continue
+            if answer.skipped:
+                continue
+            nickname = answer.minecraft_lookup_nickname or answer.answer_text
+            nickname = str(nickname or "").strip()
+            if not nickname:
+                continue
+            key = (profile_field, nickname.casefold())
+            if key in used_keys:
+                continue
+            used_keys.add(key)
+            items.append(
+                {
+                    "label": cls._minecraft_lookup_label(profile_field, answer.question_text),
+                    "nickname": nickname,
+                    "exists": answer.minecraft_lookup_exists,
+                    "uuid": answer.minecraft_lookup_uuid,
+                    "online": answer.minecraft_lookup_online,
+                    "source": answer.minecraft_lookup_source,
+                    "error": answer.minecraft_lookup_error or "disabled",
+                }
+            )
+        return cls._format_minecraft_lookup_items(items)
+
+    @classmethod
+    def _format_minecraft_lookup_items(cls, items: Sequence[Mapping[str, Any]]) -> str | None:
+        if not items:
+            return None
+        if len(items) == 1:
+            item = items[0]
+            return "\n".join(["🎮 Игрок", "", *cls._format_minecraft_lookup_lines(item, bullet=False)])
+
+        lines = ["🎮 Проверка игроков"]
+        for item in items:
+            lines.extend(["", f"{cls._e(str(item.get('label') or 'Игрок'))}:"])
+            lines.extend(cls._format_minecraft_lookup_lines(item, bullet=True))
+        return "\n".join(lines)
+
+    @classmethod
+    def _format_minecraft_lookup_lines(cls, item: Mapping[str, Any], *, bullet: bool) -> list[str]:
+        prefix = "• " if bullet else ""
+        lines = [
+            f"{prefix}Ник: {cls._e(str(item.get('nickname') or 'не указан'))}",
+            f"{prefix}Проверка: {cls._minecraft_lookup_status(item)}",
+        ]
+        if item.get("uuid"):
+            lines.append(f"{prefix}UUID: {cls._e(str(item.get('uuid')))}")
+        if item.get("online") is not None:
+            lines.append(f"{prefix}Онлайн: {'да' if item.get('online') else 'нет'}")
+        if item.get("source"):
+            lines.append(f"{prefix}Источник: {cls._e(str(item.get('source')))}")
+        if item.get("exists") is None and item.get("error") and item.get("error") != "disabled":
+            lines.append(f"{prefix}Ошибка: {cls._e(str(item.get('error')))}")
+        return lines
+
+    @staticmethod
+    def _minecraft_lookup_status(item: Mapping[str, Any]) -> str:
+        exists = item.get("exists")
+        error = item.get("error")
+        if exists is True:
+            return "✅ найден"
+        if exists is False:
+            return "❌ не найден"
+        if error == "disabled":
+            return "отключена"
+        return "⚠️ не удалось проверить"
+
+    @staticmethod
+    def _minecraft_lookup_label(profile_field: str | None, fallback_text: str) -> str:
+        if profile_field == PROFILE_FIELD_MINECRAFT_NICKNAME:
+            return "Ваш ник"
+        if profile_field == PROFILE_FIELD_MINECRAFT_TARGET_NICKNAME:
+            return "Ник нарушителя"
+        return TicketFormatter._clean_label(fallback_text)
 
     @classmethod
     def _format_answer_block(

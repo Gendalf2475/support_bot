@@ -143,6 +143,21 @@ class DiscordChannel:
         )
         return await self._send_discord_dm(user.platform_user_id, embed=embed, view=view)
 
+    async def send_minecraft_lookup_confirmation(
+        self,
+        user: Any,
+        question_index: int,
+        nickname: str,
+    ) -> SentMessageRef | None:
+        discord_ui = self._discord_ui()
+        embed = discord_ui.build_minecraft_lookup_not_found_embed(nickname)
+        view = discord_ui.MinecraftLookupConfirmView(
+            question_index=question_index,
+            owner_id=int(user.platform_user_id),
+            on_action=self._handle_action,
+        )
+        return await self._send_discord_dm(user.platform_user_id, embed=embed, view=view)
+
     async def send_ticket_preview(self, user: Any, form: Any, answers: list[dict[str, Any]]) -> SentMessageRef | None:
         discord_ui = self._discord_ui()
         embed = discord_ui.build_ticket_preview_embed(form, answers)
