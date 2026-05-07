@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 
 from aiogram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.bot.config import Settings
+from app.bot.database.models import utcnow
 from app.bot.services.ticket_form_service import TicketFormService
 from app.bot.services.platform_router import PlatformRouter
 from app.bot.services.ticket_service import TicketService
@@ -30,6 +32,10 @@ class TicketMaintenanceScheduler:
         self.ticket_form_service = ticket_form_service
         self.platform_router = platform_router
         self.scheduler = AsyncIOScheduler(timezone="UTC")
+        self.last_error: str | None = None
+        self.last_error_at: datetime | None = None
+        self.consecutive_errors = 0
+        self.last_success_at: datetime | None = None
 
     def start(self) -> None:
         if not self.has_enabled_jobs():
@@ -99,7 +105,13 @@ class TicketMaintenanceScheduler:
                         logger.info("Ticket reminders sent count=%s", reminders_sent)
 
                 await session.commit()
+                self.consecutive_errors = 0
+                self.last_error = None
+                self.last_success_at = utcnow()
         except Exception as error:
+            self.consecutive_errors += 1
+            self.last_error = str(error)
+            self.last_error_at = utcnow()
             logger.exception("Ticket maintenance check failed: %s", error)
 
     def has_enabled_jobs(self) -> bool:

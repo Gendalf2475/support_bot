@@ -9,7 +9,7 @@ from aiogram.enums import ChatMemberStatus, ChatType
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -143,6 +143,25 @@ async def lookup_player(message: Message, settings: Settings, minecraft_service:
         return
 
     await message.answer(format_player_lookup_result(result))
+
+
+@router.message(Command("health"))
+async def health(
+    message: Message,
+    session: AsyncSession,
+    settings: Settings,
+    channel_supervisor: Any | None = None,
+    ticket_scheduler: Any | None = None,
+) -> None:
+    if message.chat.id != settings.support_chat_id:
+        return
+
+    database_status, database_error = await check_database_health(session)
+    lines = ["🩺 Health", ""]
+    lines.extend(format_channel_health(channel_supervisor, settings))
+    lines.append(format_scheduler_health(ticket_scheduler))
+    lines.append(f"Database: {database_status}" + (f" ({database_error})" if database_error else ""))
+    await message.answer("\n".join(lines))
 
 
 @router.message(Command("debug_user"))
@@ -846,6 +865,67 @@ def format_username(user: User) -> str:
 def format_platform(user: User) -> str:
     names = {"telegram": "Telegram", "discord": "Discord", "vk": "VK"}
     return names.get(user.platform, user.platform)
+
+
+async def check_database_health(session: AsyncSession) -> tuple[str, str | None]:
+    try:
+        await session.execute(text("SELECT 1"))
+        return "ok", None
+    except Exception as error:
+        logger.exception("Database health check failed: %s", error)
+        return "error", f"{type(error).__name__}: {error}"
+
+
+def format_channel_health(channel_supervisor: Any | None, settings: Settings) -> list[str]:
+    statuses = {health.name: health for health in channel_supervisor.snapshot()} if channel_supervisor is not None else {}
+    defaults = [
+        ("telegram", "Telegram", settings.telegram_enabled),
+        ("discord", "Discord", settings.discord_enabled),
+        ("vk", "VK", settings.vk_enabled and settings.vk_longpoll_enabled),
+    ]
+    lines: list[str] = []
+    for name, display_name, enabled in defaults:
+        health = statuses.get(name)
+        if health is None:
+            status = "disabled" if not enabled else "unknown"
+            lines.append(f"{display_name}: {status}")
+            lines.append("Последняя ошибка: нет")
+            lines.append("Последняя ошибка в: нет")
+            lines.append("Ошибок подряд: 0")
+            lines.append("Последнее восстановление: нет")
+            lines.append("")
+            continue
+
+        lines.append(f"{display_name}: {health.status}")
+        lines.append(f"Последняя ошибка: {health.last_error_type or 'нет'}" + (f" ({health.last_error_message})" if health.last_error_message else ""))
+        lines.append(f"Последняя ошибка в: {format_dt(health.last_error_at)}")
+        lines.append(f"Ошибок подряд: {health.consecutive_errors}")
+        lines.append(f"Последнее восстановление: {format_dt(health.last_restored_at)}")
+        lines.append("")
+    return lines
+
+
+def format_scheduler_health(ticket_scheduler: Any | None) -> str:
+    if ticket_scheduler is None:
+        return "Scheduler: unknown"
+    if not ticket_scheduler.has_enabled_jobs():
+        return "Scheduler: disabled"
+    if ticket_scheduler.consecutive_errors:
+        return (
+            "Scheduler: error"
+            f"\nПоследняя ошибка: {ticket_scheduler.last_error or 'нет'}"
+            f"\nПоследняя ошибка в: {format_dt(ticket_scheduler.last_error_at)}"
+            f"\nОшибок подряд: {ticket_scheduler.consecutive_errors}"
+            f"\nПоследнее восстановление: {format_dt(ticket_scheduler.last_success_at)}"
+        )
+    if ticket_scheduler.scheduler.running:
+        return (
+            "Scheduler: working"
+            f"\nПоследняя ошибка: нет"
+            f"\nОшибок подряд: 0"
+            f"\nПоследнее восстановление: {format_dt(ticket_scheduler.last_success_at)}"
+        )
+    return "Scheduler: error\nПоследняя ошибка: scheduler is not running"
 
 
 def format_dt(value: datetime | None) -> str:

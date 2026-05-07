@@ -5,7 +5,7 @@ from collections.abc import Callable
 from typing import Any
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError
 from aiogram.types import Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -75,6 +75,9 @@ class PlatformRouter:
                     reply_markup=telegram_reply_markup,
                 )
                 return SentMessageRef(platform_message_id=str(sent.message_id))
+            except TelegramForbiddenError as error:
+                logger.warning("Failed to deliver Telegram message user_id=%s telegram_id=%s: %s", user.id, user.telegram_id, error)
+                return None
             except TelegramAPIError as error:
                 logger.error("Failed to send Telegram message user_id=%s telegram_id=%s: %s", user.id, user.telegram_id, error)
                 return None

@@ -40,6 +40,11 @@ USER_REPLY_REMINDER_ENABLED=true
 USER_REPLY_REMINDER_AFTER_HOURS=24
 USER_REPLY_REMINDER_INTERVAL_HOURS=24
 
+CHANNEL_SUPERVISOR_ENABLED=true
+CHANNEL_RESTART_ENABLED=true
+CHANNEL_RESTART_DELAY_SECONDS=10
+CHANNEL_RESTART_MAX_DELAY_SECONDS=300
+CHANNEL_RESTART_MAX_ATTEMPTS=0
 CHANNEL_FAILURE_NOTIFY_ENABLED=true
 CHANNEL_FAILURE_NOTIFY_COOLDOWN_MINUTES=30
 
@@ -57,6 +62,10 @@ VK_ENABLED=false
 VK_GROUP_TOKEN=
 VK_GROUP_ID=
 VK_LONGPOLL_ENABLED=true
+VK_RECONNECT_ENABLED=true
+VK_RECONNECT_DELAY_SECONDS=10
+VK_RECONNECT_MAX_DELAY_SECONDS=300
+VK_TIMEOUT_NOTIFY_AFTER_FAILURES=5
 
 MINECRAFT_NICKNAME_AUTOFILL_ENABLED=true
 MINECRAFT_NICKNAME_REQUIRED_ENABLED=true
@@ -81,6 +90,14 @@ MINECRAFT_NICKNAME_CHECK_STRICT=false
 alembic upgrade head
 python -m app.bot.main
 ```
+
+Через Docker:
+
+```bash
+docker compose up -d --build
+```
+
+В `docker-compose.yml` для сервиса задано `restart: unless-stopped`.
 
 Миграции создают `users`, `message_maps`, `tickets`, `ticket_answers`, `ticket_answer_media` и добавляют поля для причин закрытия, напоминаний, автозакрытия, предупреждений, ожидания ответа пользователя, пропущенных ответов, служебных сообщений тикета, порядка медиа, `media_group_id`, омниканальных платформ, сохранённого `minecraft_nickname`, времени его последней смены и результата проверки игроков через Minecraft API. Старые Telegram-пользователи получают `platform=telegram`, а `platform_user_id` заполняется старым `telegram_id`.
 
@@ -207,7 +224,7 @@ VK UI вынесен в `app/bot/channels/vk_ui.py`. Главное меню о�
 
 Текстовый fallback для Discord и VK сохранён: форму можно выбрать номером, названием, `button_text` или `id`; действия принимают `отправить`, `заново`, `отмена`, `продолжить`, `пропустить`. Это нужно для устаревших кнопок, недоступных components/keyboards и ручного ввода пользователя.
 
-Если Discord или VK канал падает, Telegram polling продолжает работать. При `CHANNEL_FAILURE_NOTIFY_ENABLED=true` бот отправляет короткое уведомление в General группы поддержки без `message_thread_id`, например `⚠️ VK-канал отключился: ошибка авторизации.` Повторные уведомления по одному каналу ограничены `CHANNEL_FAILURE_NOTIFY_COOLDOWN_MINUTES`; полный traceback остаётся в логах.
+Если Discord, VK или Telegram polling падает, supervisor логирует traceback, оставляет остальные каналы работать и перезапускает только упавший канал с backoff из `CHANNEL_RESTART_DELAY_SECONDS` до `CHANNEL_RESTART_MAX_DELAY_SECONDS`. `CHANNEL_RESTART_MAX_ATTEMPTS=0` означает бесконечные попытки; если задан лимит и он исчерпан, бот завершает процесс с кодом `1`, чтобы Docker restart policy поднял контейнер заново. VK Long Poll timeout считается временной сетевой ошибкой: бот пишет warning `VK Long Poll timeout, reconnecting...`, пересоздаёт Long Poll и уведомляет General только после `VK_TIMEOUT_NOTIFY_AFTER_FAILURES` подряд идущих сетевых ошибок. Повторные уведомления ограничены `CHANNEL_FAILURE_NOTIFY_COOLDOWN_MINUTES`; восстановление отправляется только если до этого было уведомление о падении.
 
 ## Формы тикетов
 

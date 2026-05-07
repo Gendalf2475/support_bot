@@ -4,6 +4,7 @@ import logging
 from typing import Any
 
 from app.bot.channels.base import ATTACHMENT_DOCUMENT, ATTACHMENT_PHOTO, ATTACHMENT_VIDEO, Attachment, IncomingMessage, OutgoingMessage, SentMessageRef
+from app.bot.channels.errors import is_user_delivery_error
 from app.bot.config import Settings
 from app.bot.database.models import Platform
 from app.bot.services.external_support import ExternalSupportProcessor
@@ -50,15 +51,12 @@ class DiscordChannel:
             incoming = self.build_incoming(message)
             await self.processor.handle_incoming(incoming)
 
-        try:
-            await client.start(self.settings.discord_bot_token)
-        except Exception as error:
-            logger.exception("Discord channel stopped with error: %s", error)
-            raise
+        await client.start(self.settings.discord_bot_token)
 
     async def stop(self) -> None:
         if self.client is not None:
             await self.client.close()
+            self.client = None
 
     async def send_message(self, message: OutgoingMessage) -> SentMessageRef | None:
         if self.client is None:
@@ -69,7 +67,10 @@ class DiscordChannel:
             sent = await user.send(message.text or "")
             return SentMessageRef(platform_message_id=str(sent.id))
         except Exception as error:
-            logger.exception("Failed to send Discord DM user_id=%s: %s", message.platform_user_id, error)
+            if is_user_delivery_error(Platform.DISCORD.value, error):
+                logger.warning("Failed to deliver Discord DM user_id=%s: %s", message.platform_user_id, error)
+            else:
+                logger.exception("Failed to send Discord DM user_id=%s: %s", message.platform_user_id, error)
             return None
 
     async def send_form_menu(self, user: Any, forms: list[Any], text: str | None = None) -> SentMessageRef | None:
@@ -228,7 +229,10 @@ class DiscordChannel:
             sent = await user.send(content=text, embed=embed, view=view)
             return SentMessageRef(platform_message_id=str(sent.id))
         except Exception as error:
-            logger.exception("Failed to send Discord UI DM user_id=%s: %s", platform_user_id, error)
+            if is_user_delivery_error(Platform.DISCORD.value, error):
+                logger.warning("Failed to deliver Discord UI DM user_id=%s: %s", platform_user_id, error)
+            else:
+                logger.exception("Failed to send Discord UI DM user_id=%s: %s", platform_user_id, error)
             return None
 
     async def _handle_form_select(self, interaction: Any, form_id: str) -> None:

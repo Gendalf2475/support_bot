@@ -7,6 +7,7 @@ import threading
 from typing import Any
 
 from app.bot.channels.base import ATTACHMENT_DOCUMENT, ATTACHMENT_PHOTO, ATTACHMENT_VIDEO, Attachment, IncomingMessage, OutgoingMessage, SentMessageRef
+from app.bot.channels.errors import ERROR_TEMPORARY_NETWORK, classify_vk_error, is_user_delivery_error, is_vk_read_timeout
 from app.bot.config import Settings
 from app.bot.database.models import Platform
 from app.bot.services.external_support import ExternalSupportProcessor
@@ -24,6 +25,16 @@ class VKChannel:
         self.vk_session: Any | None = None
         self.loop: asyncio.AbstractEventLoop | None = None
         self._stopped = threading.Event()
+        self.failure_notifier: Any | None = None
+        self.health_registry: Any | None = None
+        self._network_error_count = 0
+        self._reconnect_attempt = 0
+        self._reconnect_delay = 0
+        self._restore_notification_scheduled = False
+
+    def set_supervision(self, *, failure_notifier: Any | None = None, health_registry: Any | None = None) -> None:
+        self.failure_notifier = failure_notifier
+        self.health_registry = health_registry
 
     async def start(self) -> None:
         if not self.settings.vk_enabled or not self.settings.vk_longpoll_enabled:
@@ -38,25 +49,54 @@ class VKChannel:
             logger.error("VK channel is enabled, but VK_GROUP_TOKEN or VK_GROUP_ID is empty")
             raise RuntimeError("VK_GROUP_TOKEN or VK_GROUP_ID is empty")
 
+        self._stopped.clear()
         self.loop = asyncio.get_running_loop()
         self.vk_session = vk_api.VkApi(token=self.settings.vk_group_token)
-        longpoll = VkBotLongPoll(self.vk_session, int(self.settings.vk_group_id))
-        logger.info("VK long poll started group_id=%s", self.settings.vk_group_id)
+        self._network_error_count = 0
+        self._reconnect_attempt = 0
+        self._reconnect_delay = self._vk_reconnect_delay()
+        self._restore_notification_scheduled = False
 
-        def run_blocking() -> None:
-            for event in longpoll.listen():
+        while not self._stopped.is_set():
+            try:
+                longpoll = VkBotLongPoll(self.vk_session, int(self.settings.vk_group_id))
+                logger.info("VK long poll started group_id=%s", self.settings.vk_group_id)
+                if not self._network_error_count:
+                    self._mark_working()
+                await asyncio.to_thread(self._listen_blocking, longpoll, VkBotEventType)
                 if self._stopped.is_set():
                     return
-                if event.type != VkBotEventType.MESSAGE_NEW:
-                    continue
-                incoming = self.build_incoming(event.object.message)
-                asyncio.run_coroutine_threadsafe(self.processor.handle_incoming(incoming), self.loop)
+                raise RuntimeError("VK long poll exited unexpectedly")
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                info = classify_vk_error(error)
+                if info.error_type != ERROR_TEMPORARY_NETWORK or not self.settings.vk_reconnect_enabled:
+                    raise
 
-        try:
-            await asyncio.to_thread(run_blocking)
-        except Exception as error:
-            logger.exception("VK channel stopped with error: %s", error)
-            raise
+                self._network_error_count += 1
+                self._reconnect_attempt += 1
+                current_delay = self._reconnect_delay
+                self._mark_reconnecting(error, self._network_error_count)
+                if is_vk_read_timeout(error):
+                    logger.warning(
+                        "VK Long Poll timeout, reconnecting attempt=%s delay=%s",
+                        self._reconnect_attempt,
+                        current_delay,
+                    )
+                else:
+                    logger.warning(
+                        "VK Long Poll network error, reconnecting attempt=%s delay=%s error=%s",
+                        self._reconnect_attempt,
+                        current_delay,
+                        error,
+                    )
+                await self._notify_timeout_instability(self._network_error_count)
+                await asyncio.sleep(current_delay)
+                self._reconnect_delay = min(
+                    max(current_delay * 2, self._vk_reconnect_delay()),
+                    self._vk_reconnect_max_delay(),
+                )
 
     async def stop(self) -> None:
         self._stopped.set()
@@ -201,8 +241,81 @@ class VKChannel:
             response = vk.messages.send(**payload)
             return SentMessageRef(platform_message_id=str(response))
         except Exception as error:
-            logger.exception("Failed to send VK message user_id=%s: %s", platform_user_id, error)
+            if is_user_delivery_error(Platform.VK.value, error):
+                logger.warning("Failed to deliver VK message user_id=%s: %s", platform_user_id, error)
+            else:
+                logger.exception("Failed to send VK message user_id=%s: %s", platform_user_id, error)
             return None
+
+    def _listen_blocking(self, longpoll: Any, event_type: Any) -> None:
+        for event in longpoll.listen():
+            if self._stopped.is_set():
+                return
+            self._schedule_restored_if_needed()
+            if event.type != event_type.MESSAGE_NEW:
+                continue
+            incoming = self.build_incoming(event.object.message)
+            if self.loop is None:
+                logger.error("VK event loop is not available")
+                continue
+            future = asyncio.run_coroutine_threadsafe(self.processor.handle_incoming(incoming), self.loop)
+            future.add_done_callback(self._log_incoming_error)
+
+    @staticmethod
+    def _log_incoming_error(future: Any) -> None:
+        try:
+            future.result()
+        except Exception as error:
+            logger.exception("Failed to handle VK incoming message: %s", error)
+
+    def _vk_reconnect_delay(self) -> int:
+        return max(0, self.settings.vk_reconnect_delay_seconds)
+
+    def _vk_reconnect_max_delay(self) -> int:
+        return max(self._vk_reconnect_delay(), self.settings.vk_reconnect_max_delay_seconds)
+
+    def _mark_working(self) -> None:
+        if self.health_registry is not None:
+            self.health_registry.mark_working(Platform.VK.value)
+
+    def _mark_reconnecting(self, error: Exception, consecutive_errors: int) -> None:
+        if self.health_registry is not None:
+            self.health_registry.mark_reconnecting(
+                Platform.VK.value,
+                error_type=ERROR_TEMPORARY_NETWORK,
+                error=error,
+                consecutive_errors=consecutive_errors,
+            )
+
+    async def _notify_timeout_instability(self, consecutive_errors: int) -> None:
+        notify_after = max(1, self.settings.vk_timeout_notify_after_failures)
+        if consecutive_errors < notify_after or self.failure_notifier is None:
+            return
+        await self.failure_notifier.notify_failure(
+            Platform.VK.value,
+            ERROR_TEMPORARY_NETWORK,
+            text="⚠️ VK-канал временно нестабилен: проблемы соединения с VK Long Poll. Бот продолжает переподключаться.",
+        )
+
+    def _schedule_restored_if_needed(self) -> None:
+        if self._network_error_count <= 0 or self.loop is None or self._restore_notification_scheduled:
+            return
+        self._restore_notification_scheduled = True
+        asyncio.run_coroutine_threadsafe(self._notify_restored(), self.loop)
+
+    async def _notify_restored(self) -> None:
+        had_network_errors = self._network_error_count > 0
+        self._network_error_count = 0
+        self._reconnect_attempt = 0
+        self._reconnect_delay = self._vk_reconnect_delay()
+        self._restore_notification_scheduled = False
+        if not had_network_errors:
+            return
+        if self.health_registry is not None:
+            self.health_registry.mark_restored(Platform.VK.value)
+        logger.info("Channel restored channel=vk")
+        if self.failure_notifier is not None:
+            await self.failure_notifier.notify_restored(Platform.VK.value)
 
     @staticmethod
     def build_incoming(message: dict[str, Any]) -> IncomingMessage:
