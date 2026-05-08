@@ -7,7 +7,13 @@ import threading
 from typing import Any
 
 from app.bot.channels.base import ATTACHMENT_DOCUMENT, ATTACHMENT_PHOTO, ATTACHMENT_VIDEO, Attachment, IncomingMessage, OutgoingMessage, SentMessageRef
-from app.bot.channels.errors import ERROR_TEMPORARY_NETWORK, classify_vk_error, is_user_delivery_error, is_vk_read_timeout
+from app.bot.channels.errors import (
+    ERROR_TEMPORARY_NETWORK,
+    classify_vk_error,
+    is_user_delivery_error,
+    is_vk_connection_error,
+    is_vk_timeout_error,
+)
 from app.bot.config import Settings
 from app.bot.database.models import Platform
 from app.bot.services.external_support import ExternalSupportProcessor
@@ -78,9 +84,15 @@ class VKChannel:
                 self._reconnect_attempt += 1
                 current_delay = self._reconnect_delay
                 self._mark_reconnecting(error, self._network_error_count)
-                if is_vk_read_timeout(error):
+                if is_vk_timeout_error(error):
                     logger.warning(
                         "VK Long Poll timeout, reconnecting attempt=%s delay=%s",
+                        self._reconnect_attempt,
+                        current_delay,
+                    )
+                elif is_vk_connection_error(error):
+                    logger.warning(
+                        "VK Long Poll connection error, reconnecting attempt=%s delay=%s",
                         self._reconnect_attempt,
                         current_delay,
                     )
@@ -248,18 +260,25 @@ class VKChannel:
             return None
 
     def _listen_blocking(self, longpoll: Any, event_type: Any) -> None:
-        for event in longpoll.listen():
-            if self._stopped.is_set():
-                return
+        while not self._stopped.is_set():
+            events = longpoll.check() or []
             self._schedule_restored_if_needed()
-            if event.type != event_type.MESSAGE_NEW:
-                continue
-            incoming = self.build_incoming(event.object.message)
-            if self.loop is None:
-                logger.error("VK event loop is not available")
-                continue
-            future = asyncio.run_coroutine_threadsafe(self.processor.handle_incoming(incoming), self.loop)
-            future.add_done_callback(self._log_incoming_error)
+            for event in events:
+                if self._stopped.is_set():
+                    return
+                self._handle_event(event, event_type)
+
+    def _handle_event(self, event: Any, event_type: Any) -> None:
+        if self._stopped.is_set():
+            return
+        if event.type != event_type.MESSAGE_NEW:
+            return
+        incoming = self.build_incoming(event.object.message)
+        if self.loop is None:
+            logger.error("VK event loop is not available")
+            return
+        future = asyncio.run_coroutine_threadsafe(self.processor.handle_incoming(incoming), self.loop)
+        future.add_done_callback(self._log_incoming_error)
 
     @staticmethod
     def _log_incoming_error(future: Any) -> None:
@@ -294,7 +313,7 @@ class VKChannel:
         await self.failure_notifier.notify_failure(
             Platform.VK.value,
             ERROR_TEMPORARY_NETWORK,
-            text="⚠️ VK-канал временно нестабилен: проблемы соединения с VK Long Poll. Бот продолжает переподключаться.",
+            text="⚠️ VK-канал временно нестабилен: проблемы соединения с VK Long Poll. Бот переподключается.",
         )
 
     def _schedule_restored_if_needed(self) -> None:

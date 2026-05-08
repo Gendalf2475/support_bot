@@ -85,11 +85,19 @@ def classify_telegram_error(error: BaseException) -> ChannelErrorInfo:
 
 
 def is_vk_temporary_network_error(error: BaseException) -> bool:
-    return _is_instance(error, "requests.exceptions", ("ReadTimeout", "Timeout", "ConnectionError")) or _is_instance(
+    return is_vk_timeout_error(error) or is_vk_connection_error(error)
+
+
+def is_vk_timeout_error(error: BaseException) -> bool:
+    return _is_instance(error, "requests.exceptions", ("ReadTimeout", "Timeout")) or _is_instance(
         error,
         "urllib3.exceptions",
         ("ReadTimeoutError",),
     )
+
+
+def is_vk_connection_error(error: BaseException) -> bool:
+    return _is_instance(error, "requests.exceptions", ("ConnectionError",))
 
 
 def is_vk_read_timeout(error: BaseException) -> bool:

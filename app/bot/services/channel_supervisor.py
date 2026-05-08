@@ -17,6 +17,7 @@ from app.bot.channels.errors import (
     ERROR_PERMISSION,
     ERROR_POLLING_CONFLICT,
     ERROR_TEMPORARY_NETWORK,
+    ERROR_UNEXPECTED,
     classify_channel_error,
 )
 from app.bot.config import Settings
@@ -251,7 +252,22 @@ class ChannelSupervisor:
                     error=error,
                     consecutive_errors=restart_attempt,
                 )
-                logger.exception("Channel crashed channel=%s error_type=%s", spec.name, info.error_type)
+                if info.error_type == ERROR_TEMPORARY_NETWORK:
+                    logger.warning(
+                        "Channel stopped by temporary network error channel=%s error_type=%s error=%s",
+                        spec.name,
+                        info.error_type,
+                        error,
+                    )
+                elif info.error_type == ERROR_UNEXPECTED:
+                    logger.exception("Channel crashed channel=%s error_type=%s", spec.name, info.error_type)
+                else:
+                    logger.error(
+                        "Channel crashed channel=%s error_type=%s error=%s",
+                        spec.name,
+                        info.error_type,
+                        error,
+                    )
                 await self.notifier.notify_failure(spec.name, info.error_type)
             else:
                 restore_task.cancel()
@@ -329,7 +345,7 @@ class ChannelSupervisor:
 def failure_notification_text(channel_name: str, error_type: str) -> str:
     if channel_name == "vk":
         if error_type == ERROR_AUTH:
-            return "⚠️ VK-канал отключился: ошибка авторизации VK."
+            return "⚠️ VK-канал отключился: ошибка авторизации VK. Проверьте VK_GROUP_TOKEN."
         if error_type == ERROR_PERMISSION:
             return "⚠️ VK-канал отключился: нет нужных прав у VK-токена."
         if error_type == ERROR_TEMPORARY_NETWORK:

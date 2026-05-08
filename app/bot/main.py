@@ -9,7 +9,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.exceptions import TelegramAPIError
 from sqlalchemy import text
 
-from app.bot.channels.errors import classify_channel_error
+from app.bot.channels.errors import ERROR_TEMPORARY_NETWORK, ERROR_UNEXPECTED, classify_channel_error
 from app.bot.channels.discord_channel import DiscordChannel
 from app.bot.channels.telegram_channel import TelegramChannel
 from app.bot.channels.vk_channel import VKChannel
@@ -177,7 +177,17 @@ async def run_channel(name: str, starter: Callable[[], Awaitable[None]], notifie
         raise
     except Exception as error:
         info = classify_channel_error(name, error)
-        logger.exception("Channel crashed channel=%s error_type=%s", name, info.error_type)
+        if info.error_type == ERROR_TEMPORARY_NETWORK:
+            logger.warning(
+                "Channel stopped by temporary network error channel=%s error_type=%s error=%s",
+                name,
+                info.error_type,
+                error,
+            )
+        elif info.error_type == ERROR_UNEXPECTED:
+            logger.exception("Channel crashed channel=%s error_type=%s", name, info.error_type)
+        else:
+            logger.error("Channel crashed channel=%s error_type=%s error=%s", name, info.error_type, error)
         await notifier.notify_failure(name, info.error_type)
 
 
