@@ -3,13 +3,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 import threading
 from typing import Any
 
 from app.bot.channels.base import ATTACHMENT_DOCUMENT, ATTACHMENT_PHOTO, ATTACHMENT_VIDEO, Attachment, IncomingMessage, OutgoingMessage, SentMessageRef
 from app.bot.channels.errors import (
+    ERROR_AUTH,
+    ERROR_PERMISSION,
     ERROR_TEMPORARY_NETWORK,
+    ERROR_UNEXPECTED,
     classify_vk_error,
+    get_vk_error_code,
     is_user_delivery_error,
     is_vk_connection_error,
     is_vk_timeout_error,
@@ -20,6 +25,10 @@ from app.bot.services.external_support import ExternalSupportProcessor
 
 
 logger = logging.getLogger(__name__)
+
+VK_AUTH_RETRY_DELAY_SECONDS = 300
+VK_AUTH_FAILURE_TEXT = "⚠️ VK-канал отключился: ошибка авторизации VK. Проверьте VK_GROUP_TOKEN/VK_GROUP_ID."
+VK_TEMPORARY_FAILURE_TEXT = "⚠️ VK-канал временно нестабилен: проблемы соединения с VK. Бот переподключается."
 
 
 class VKChannel:
@@ -33,6 +42,7 @@ class VKChannel:
         self._stopped = threading.Event()
         self.failure_notifier: Any | None = None
         self.health_registry: Any | None = None
+        self._consecutive_error_count = 0
         self._network_error_count = 0
         self._reconnect_attempt = 0
         self._reconnect_delay = 0
@@ -51,13 +61,10 @@ class VKChannel:
         except ImportError as error:
             logger.error("vk_api is not installed; VK channel is disabled")
             raise RuntimeError("vk_api is not installed") from error
-        if not self.settings.vk_group_token or not self.settings.vk_group_id:
-            logger.error("VK channel is enabled, but VK_GROUP_TOKEN or VK_GROUP_ID is empty")
-            raise RuntimeError("VK_GROUP_TOKEN or VK_GROUP_ID is empty")
 
         self._stopped.clear()
         self.loop = asyncio.get_running_loop()
-        self.vk_session = vk_api.VkApi(token=self.settings.vk_group_token)
+        self._consecutive_error_count = 0
         self._network_error_count = 0
         self._reconnect_attempt = 0
         self._reconnect_delay = self._vk_reconnect_delay()
@@ -65,50 +72,31 @@ class VKChannel:
 
         while not self._stopped.is_set():
             try:
-                longpoll = VkBotLongPoll(self.vk_session, int(self.settings.vk_group_id))
-                logger.info("VK long poll started group_id=%s", self.settings.vk_group_id)
-                if not self._network_error_count:
+                group_id = self._vk_group_id()
+                self.vk_session = vk_api.VkApi(token=self.settings.vk_group_token)
+                longpoll = VkBotLongPoll(self.vk_session, group_id)
+                logger.info("VK Long Poll started group_id=%s", group_id)
+                if self._consecutive_error_count <= 0:
                     self._mark_working()
                 await asyncio.to_thread(self._listen_blocking, longpoll, VkBotEventType)
                 if self._stopped.is_set():
                     return
-                raise RuntimeError("VK long poll exited unexpectedly")
+                raise RuntimeError("VK Long Poll exited unexpectedly")
             except asyncio.CancelledError:
                 raise
             except Exception as error:
-                info = classify_vk_error(error)
-                if info.error_type != ERROR_TEMPORARY_NETWORK or not self.settings.vk_reconnect_enabled:
+                if not self.settings.vk_reconnect_enabled:
                     raise
 
-                self._network_error_count += 1
-                self._reconnect_attempt += 1
-                current_delay = self._reconnect_delay
-                self._mark_reconnecting(error, self._network_error_count)
-                if is_vk_timeout_error(error):
-                    logger.warning(
-                        "VK Long Poll timeout, reconnecting attempt=%s delay=%s",
-                        self._reconnect_attempt,
-                        current_delay,
-                    )
-                elif is_vk_connection_error(error):
-                    logger.warning(
-                        "VK Long Poll connection error, reconnecting attempt=%s delay=%s",
-                        self._reconnect_attempt,
-                        current_delay,
-                    )
-                else:
-                    logger.warning(
-                        "VK Long Poll network error, reconnecting attempt=%s delay=%s error=%s",
-                        self._reconnect_attempt,
-                        current_delay,
-                        error,
-                    )
-                await self._notify_timeout_instability(self._network_error_count)
-                await asyncio.sleep(current_delay)
-                self._reconnect_delay = min(
-                    max(current_delay * 2, self._vk_reconnect_delay()),
-                    self._vk_reconnect_max_delay(),
-                )
+                info = classify_vk_error(error)
+                if info.error_type == ERROR_TEMPORARY_NETWORK:
+                    await self._handle_temporary_error(error)
+                    continue
+                if info.error_type in {ERROR_AUTH, ERROR_PERMISSION}:
+                    await self._handle_auth_error(error, info.error_type)
+                    continue
+
+                await self._handle_unexpected_error(error)
 
     async def stop(self) -> None:
         self._stopped.set()
@@ -287,6 +275,94 @@ class VKChannel:
         except Exception as error:
             logger.exception("Failed to handle VK incoming message: %s", error)
 
+    def _vk_group_id(self) -> int:
+        if not self.settings.vk_group_token or not self.settings.vk_group_id:
+            raise RuntimeError("VK_GROUP_TOKEN or VK_GROUP_ID is empty")
+        try:
+            return int(self.settings.vk_group_id)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(f"invalid VK_GROUP_ID: {self.settings.vk_group_id}") from error
+
+    async def _handle_temporary_error(self, error: Exception) -> None:
+        self._consecutive_error_count += 1
+        self._network_error_count += 1
+        self._reconnect_attempt += 1
+        current_delay = self._reconnect_delay
+        self._mark_reconnecting(error, self._network_error_count)
+        self._log_temporary_error(error, self._reconnect_attempt, current_delay)
+        await self._notify_timeout_instability(self._network_error_count)
+        await self._sleep_reconnect_delay(current_delay)
+        self._reconnect_delay = min(
+            max(current_delay * 2, self._vk_reconnect_delay()),
+            self._vk_reconnect_max_delay(),
+        )
+
+    async def _handle_auth_error(self, error: Exception, error_type: str) -> None:
+        self.vk_session = None
+        self._consecutive_error_count += 1
+        self._network_error_count = 0
+        self._reconnect_attempt = 0
+        self._reconnect_delay = self._vk_reconnect_delay()
+        self._mark_auth_error(error, error_type, self._consecutive_error_count)
+        code = get_vk_error_code(error)
+        if code is None:
+            logger.error(
+                "VK auth error, retry in %s seconds: %s",
+                VK_AUTH_RETRY_DELAY_SECONDS,
+                self._format_vk_error(error),
+            )
+        else:
+            logger.error("VK auth error code=%s, retry in %s seconds", code, VK_AUTH_RETRY_DELAY_SECONDS)
+        if self.failure_notifier is not None:
+            await self.failure_notifier.notify_failure(Platform.VK.value, ERROR_AUTH, text=VK_AUTH_FAILURE_TEXT)
+        await self._sleep_reconnect_delay(VK_AUTH_RETRY_DELAY_SECONDS)
+
+    async def _handle_unexpected_error(self, error: Exception) -> None:
+        self._consecutive_error_count += 1
+        self._network_error_count = 0
+        self._reconnect_attempt += 1
+        current_delay = self._reconnect_delay
+        self._mark_unexpected_error(error, self._consecutive_error_count)
+        logger.exception(
+            "VK unexpected error, reconnecting attempt=%s delay=%s",
+            self._reconnect_attempt,
+            current_delay,
+        )
+        if self.failure_notifier is not None:
+            await self.failure_notifier.notify_failure(Platform.VK.value, ERROR_UNEXPECTED)
+        await self._sleep_reconnect_delay(current_delay)
+        self._reconnect_delay = min(
+            max(current_delay * 2, self._vk_reconnect_delay()),
+            self._vk_reconnect_max_delay(),
+        )
+
+    def _log_temporary_error(self, error: Exception, attempt: int, delay: int) -> None:
+        code = get_vk_error_code(error)
+        if code is not None:
+            logger.warning(
+                "VK temporary error type=api_error code=%s, reconnecting attempt=%s delay=%s",
+                code,
+                attempt,
+                delay,
+            )
+        elif is_vk_timeout_error(error):
+            logger.warning("VK Long Poll timeout, reconnecting attempt=%s delay=%s", attempt, delay)
+        elif is_vk_connection_error(error):
+            logger.warning("VK Long Poll connection error, reconnecting attempt=%s delay=%s", attempt, delay)
+        else:
+            logger.warning(
+                "VK temporary error type=%s, reconnecting attempt=%s delay=%s error=%s",
+                type(error).__name__,
+                attempt,
+                delay,
+                error,
+            )
+
+    async def _sleep_reconnect_delay(self, delay: int) -> None:
+        if delay <= 0:
+            return
+        await asyncio.sleep(delay)
+
     def _vk_reconnect_delay(self) -> int:
         return max(0, self.settings.vk_reconnect_delay_seconds)
 
@@ -302,7 +378,25 @@ class VKChannel:
             self.health_registry.mark_reconnecting(
                 Platform.VK.value,
                 error_type=ERROR_TEMPORARY_NETWORK,
-                error=error,
+                error=self._format_vk_error(error),
+                consecutive_errors=consecutive_errors,
+            )
+
+    def _mark_auth_error(self, error: Exception, error_type: str, consecutive_errors: int) -> None:
+        if self.health_registry is not None:
+            self.health_registry.mark_auth_error(
+                Platform.VK.value,
+                error_type=error_type,
+                error=self._format_vk_error(error),
+                consecutive_errors=consecutive_errors,
+            )
+
+    def _mark_unexpected_error(self, error: Exception, consecutive_errors: int) -> None:
+        if self.health_registry is not None:
+            self.health_registry.mark_error(
+                Platform.VK.value,
+                error_type=ERROR_UNEXPECTED,
+                error=self._format_vk_error(error),
                 consecutive_errors=consecutive_errors,
             )
 
@@ -313,28 +407,55 @@ class VKChannel:
         await self.failure_notifier.notify_failure(
             Platform.VK.value,
             ERROR_TEMPORARY_NETWORK,
-            text="⚠️ VK-канал временно нестабилен: проблемы соединения с VK Long Poll. Бот переподключается.",
+            text=VK_TEMPORARY_FAILURE_TEXT,
         )
 
     def _schedule_restored_if_needed(self) -> None:
-        if self._network_error_count <= 0 or self.loop is None or self._restore_notification_scheduled:
+        if self._consecutive_error_count <= 0 or self.loop is None or self._restore_notification_scheduled:
             return
         self._restore_notification_scheduled = True
-        asyncio.run_coroutine_threadsafe(self._notify_restored(), self.loop)
+        asyncio.run_coroutine_threadsafe(self._notify_restored(self._consecutive_error_count), self.loop)
 
-    async def _notify_restored(self) -> None:
-        had_network_errors = self._network_error_count > 0
+    async def _notify_restored(self, expected_error_count: int) -> None:
+        if self._consecutive_error_count != expected_error_count:
+            self._restore_notification_scheduled = False
+            return
+        had_channel_errors = self._consecutive_error_count > 0
+        self._consecutive_error_count = 0
         self._network_error_count = 0
         self._reconnect_attempt = 0
         self._reconnect_delay = self._vk_reconnect_delay()
         self._restore_notification_scheduled = False
-        if not had_network_errors:
+        if not had_channel_errors:
             return
         if self.health_registry is not None:
             self.health_registry.mark_restored(Platform.VK.value)
-        logger.info("Channel restored channel=vk")
+        logger.info("VK Long Poll restored")
         if self.failure_notifier is not None:
             await self.failure_notifier.notify_restored(Platform.VK.value)
+
+    @staticmethod
+    def _format_vk_error(error: Exception) -> str:
+        error_type = type(error).__name__
+        message = VKChannel._vk_error_message(error)
+        code = get_vk_error_code(error)
+        if code is None:
+            return f"{error_type}: {message}" if message else error_type
+        message = re.sub(rf"^\[?{code}\]?\s*[:.-]?\s*", "", message)
+        return f"{error_type} {code}" + (f" {message}" if message else "")
+
+    @staticmethod
+    def _vk_error_message(error: Exception) -> str:
+        raw_message = getattr(error, "error_msg", None)
+        if raw_message:
+            return str(raw_message).strip()
+        for attr_name in ("error", "data"):
+            raw_data = getattr(error, attr_name, None)
+            if isinstance(raw_data, dict):
+                raw_message = raw_data.get("error_msg") or raw_data.get("message")
+                if raw_message:
+                    return str(raw_message).strip()
+        return str(error).strip()
 
     @staticmethod
     def build_incoming(message: dict[str, Any]) -> IncomingMessage:

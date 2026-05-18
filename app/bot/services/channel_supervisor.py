@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 CHANNEL_STATUS_WORKING = "working"
 CHANNEL_STATUS_RECONNECTING = "reconnecting"
 CHANNEL_STATUS_DISABLED = "disabled"
+CHANNEL_STATUS_AUTH_ERROR = "auth_error"
 CHANNEL_STATUS_ERROR = "error"
 CHANNEL_STATUS_STARTING = "starting"
 
@@ -112,7 +113,26 @@ class ChannelHealthRegistry:
         consecutive_errors: int,
     ) -> None:
         health = self._channels[name]
-        health.status = CHANNEL_STATUS_ERROR
+        health.status = (
+            CHANNEL_STATUS_AUTH_ERROR
+            if name == "vk" and error_type in {ERROR_AUTH, ERROR_PERMISSION}
+            else CHANNEL_STATUS_ERROR
+        )
+        health.last_error_type = error_type
+        health.last_error_message = _short_error(error)
+        health.last_error_at = utcnow()
+        health.consecutive_errors = consecutive_errors
+
+    def mark_auth_error(
+        self,
+        name: str,
+        *,
+        error_type: str,
+        error: BaseException | str,
+        consecutive_errors: int,
+    ) -> None:
+        health = self._channels[name]
+        health.status = CHANNEL_STATUS_AUTH_ERROR
         health.last_error_type = error_type
         health.last_error_message = _short_error(error)
         health.last_error_at = utcnow()
@@ -345,11 +365,11 @@ class ChannelSupervisor:
 def failure_notification_text(channel_name: str, error_type: str) -> str:
     if channel_name == "vk":
         if error_type == ERROR_AUTH:
-            return "⚠️ VK-канал отключился: ошибка авторизации VK. Проверьте VK_GROUP_TOKEN."
+            return "⚠️ VK-канал отключился: ошибка авторизации VK. Проверьте VK_GROUP_TOKEN/VK_GROUP_ID."
         if error_type == ERROR_PERMISSION:
-            return "⚠️ VK-канал отключился: нет нужных прав у VK-токена."
+            return "⚠️ VK-канал отключился: ошибка авторизации VK. Проверьте VK_GROUP_TOKEN/VK_GROUP_ID."
         if error_type == ERROR_TEMPORARY_NETWORK:
-            return "⚠️ VK-канал отключился: ошибка сети. Бот пытается восстановить соединение."
+            return "⚠️ VK-канал временно нестабилен: проблемы соединения с VK. Бот переподключается."
         return "⚠️ VK-канал отключился: unexpected error. Подробности в логах."
 
     if channel_name == "discord":

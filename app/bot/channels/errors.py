@@ -15,6 +15,10 @@ ERROR_USER_DM_FORBIDDEN = "user_dm_forbidden"
 ERROR_POLLING_CONFLICT = "polling_conflict"
 ERROR_UNEXPECTED = "unexpected_error"
 
+VK_TEMPORARY_API_ERROR_CODES = {1, 6, 9, 10, 500}
+VK_AUTH_ERROR_CODES = {5, 27}
+VK_PERMISSION_ERROR_CODES = {15}
+
 
 @dataclass(frozen=True)
 class ChannelErrorInfo:
@@ -34,16 +38,31 @@ def classify_channel_error(channel_name: str, error: BaseException) -> ChannelEr
 
 
 def classify_vk_error(error: BaseException) -> ChannelErrorInfo:
-    if is_vk_temporary_network_error(error):
-        return ChannelErrorInfo(ERROR_TEMPORARY_NETWORK, is_temporary=True)
-
     code = get_vk_error_code(error)
-    if code == 27:
+    if code in VK_TEMPORARY_API_ERROR_CODES:
+        return ChannelErrorInfo(ERROR_TEMPORARY_NETWORK, is_temporary=True)
+    if code in VK_AUTH_ERROR_CODES:
         return ChannelErrorInfo(ERROR_AUTH)
-    if code == 15:
+    if code in VK_PERMISSION_ERROR_CODES:
         return ChannelErrorInfo(ERROR_PERMISSION)
     if code in {901, 902}:
         return ChannelErrorInfo(ERROR_USER_DM_FORBIDDEN, is_user_delivery_error=True)
+
+    if is_vk_temporary_network_error(error):
+        return ChannelErrorInfo(ERROR_TEMPORARY_NETWORK, is_temporary=True)
+
+    normalized = _normalized_error(error)
+    if (
+        "invalid access token" in normalized
+        or "user authorization failed" in normalized
+        or "group authorization failed" in normalized
+        or "vk_group_token" in normalized
+        or "vk_group_id" in normalized
+    ):
+        return ChannelErrorInfo(ERROR_AUTH)
+    if "access denied" in normalized:
+        return ChannelErrorInfo(ERROR_PERMISSION)
+
     if is_json_decode_error(error):
         return ChannelErrorInfo(ERROR_INVALID_RESPONSE, is_temporary=True)
 
@@ -97,7 +116,11 @@ def is_vk_timeout_error(error: BaseException) -> bool:
 
 
 def is_vk_connection_error(error: BaseException) -> bool:
-    return _is_instance(error, "requests.exceptions", ("ConnectionError",))
+    return _is_instance(error, "requests.exceptions", ("ConnectionError",)) or _is_instance(
+        error,
+        "urllib3.exceptions",
+        ("ProtocolError", "MaxRetryError"),
+    )
 
 
 def is_vk_read_timeout(error: BaseException) -> bool:

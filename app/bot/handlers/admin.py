@@ -896,7 +896,10 @@ def format_channel_health(channel_supervisor: Any | None, settings: Settings) ->
             lines.append("")
             continue
 
-        lines.append(f"{display_name}: {health.status}")
+        summary = f"{display_name}: {health.status}"
+        if health.status != "working" and health.last_error_message:
+            summary += f", last_error={health.last_error_message}"
+        lines.append(summary)
         lines.append(f"Последняя ошибка: {health.last_error_type or 'нет'}" + (f" ({health.last_error_message})" if health.last_error_message else ""))
         lines.append(f"Последняя ошибка в: {format_dt(health.last_error_at)}")
         lines.append(f"Ошибок подряд: {health.consecutive_errors}")
